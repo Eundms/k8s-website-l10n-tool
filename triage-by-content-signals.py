@@ -9,6 +9,7 @@ Usage:
     python3 scripts/triage-by-content-signals.py --lang ko [--detailed]
     python3 scripts/triage-by-content-signals.py --langs ko,zh-cn,ja
     python3 scripts/triage-by-content-signals.py --all-langs --output-dir /tmp/l10n
+    python3 triage-by-content-signals.py --lang ko --repo-root /path/to/website
 """
 
 import argparse
@@ -723,6 +724,12 @@ def main() -> None:
         help="All locales under content/ except en",
     )
     parser.add_argument(
+        "--repo-root",
+        default=None,
+        metavar="DIR",
+        help="Path to kubernetes/website repo root (auto-detected if omitted)",
+    )
+    parser.add_argument(
         "--output-dir",
         default=".",
         metavar="DIR",
@@ -735,7 +742,27 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if args.repo_root:
+        repo_root = os.path.abspath(args.repo_root)
+    else:
+        # Auto-detect: walk up from cwd looking for content/en
+        d = os.path.abspath(os.getcwd())
+        repo_root = None
+        while True:
+            if os.path.isdir(os.path.join(d, "content", "en")):
+                repo_root = d
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        if repo_root is None:
+            print(
+                "error: could not auto-detect repo root (no content/en found "
+                "above cwd). Use --repo-root to specify it explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     date = datetime.date.today().isoformat()
 
     if args.lang:
