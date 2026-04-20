@@ -36,9 +36,6 @@ That approach fails in three common ways:
 - **Longer-but-older files.** A translation can be *longer* than English
   while still being outdated, because it preserves old sections that
   English has since removed.
-- **Hidden gaps.** Chinese pages often keep the original English inside
-  hidden HTML comments. File size and dates look normal — but readers only
-  see 10% translated content.
 
 ---
 
