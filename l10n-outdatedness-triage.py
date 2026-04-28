@@ -4,7 +4,7 @@
 Compares each localized Markdown page against its English source using
 content-based indicators (length gap, missing headings/code/anchors,
 version mismatch, API/feature-state token mismatch) and classifies it as
-`highly_outdated`, `possibly_outdated`, or `up_to_date`.
+`Outdated`, `Possibly outdated`, or `Up to date`.
 
 Usage:
     # Inside the kubernetes/website repo
@@ -79,9 +79,9 @@ _ORPHAN_REASON = (
     "upstream or is intentionally locale-specific."
 )
 
-STATUS_HIGHLY_OUTDATED = "highly_outdated"
-STATUS_POSSIBLY_OUTDATED = "possibly_outdated"
-STATUS_CURRENT = "up_to_date"
+STATUS_HIGHLY_OUTDATED = "Outdated"
+STATUS_POSSIBLY_OUTDATED = "Possibly outdated"
+STATUS_CURRENT = "Up to date"
 
 _STRONG_H2_THRESHOLD = 2
 _STRONG_H3_WITH_H2_THRESHOLD = 5
@@ -571,15 +571,15 @@ def classify_file_status(
 ) -> str:
     """Classification rules, in order:
 
-    1. `empty_stub` or `severe_api_and_feature_mismatch` → highly_outdated.
-    2. ≥2 strong → highly_outdated.
-    3. ≥1 strong + ≥1 supporting → highly_outdated.
-    4. `large_length_gap` + ≥1 non-length-gap supporting → highly_outdated
+    1. `empty_stub` or `severe_api_and_feature_mismatch` → Outdated.
+    2. ≥2 strong → Outdated.
+    3. ≥1 strong + ≥1 supporting → Outdated.
+    4. `large_length_gap` + ≥1 non-length-gap supporting → Outdated
        (guarded against the Latin translated-anchor false-alarm).
-    5. ≥3 supporting → highly_outdated.
-    6. ≥1 strong or ≥1 supporting → possibly_outdated.
-    7. `small_length_gap` → possibly_outdated.
-    8. Otherwise → up_to_date.
+    5. ≥3 supporting → Outdated.
+    6. ≥1 strong or ≥1 supporting → Possibly outdated.
+    7. `small_length_gap` → Possibly outdated.
+    8. Otherwise → Up to date.
     """
     if not indicators:
         return STATUS_CURRENT
@@ -646,6 +646,8 @@ def build_locale_report(
     detailed: bool,
 ) -> str:
     hi, poss, curr = count_files_by_status(evaluated)
+    w = max(len(STATUS_HIGHLY_OUTDATED), len(STATUS_POSSIBLY_OUTDATED),
+            len(STATUS_CURRENT), len("Evaluated"), len("Orphans"))
     lines: List[str] = [
         f"## Localization status: `{locale}`",
         "",
@@ -655,11 +657,11 @@ def build_locale_report(
         "",
         "| Status | Count |",
         "|---|---:|",
-        f"| Evaluated localized files | {len(evaluated)} |",
-        f"| highly_outdated   | {hi} |",
-        f"| possibly_outdated | {poss} |",
-        f"| up_to_date        | {curr} |",
-        f"| Orphans (no source) | {len(orphans)} |",
+        f"| {'Evaluated':<{w}} | {len(evaluated)} |",
+        f"| {STATUS_CURRENT:<{w}} | {curr} |",
+        f"| {'Orphans':<{w}} | {len(orphans)} |",
+        f"| {STATUS_HIGHLY_OUTDATED:<{w}} | {hi} |",
+        f"| {STATUS_POSSIBLY_OUTDATED:<{w}} | {poss} |",
         "",
     ]
 
@@ -682,12 +684,22 @@ def build_locale_report(
     for fr in evaluated:
         by_status[fr.status].append(fr)
 
-    for title, key in (
-        ("Highly outdated", STATUS_HIGHLY_OUTDATED),
-        ("Possibly outdated", STATUS_POSSIBLY_OUTDATED),
-    ):
+    lines.extend([
+        f"### Orphan localized files, no English source ({len(orphans)})",
+        "",
+    ])
+    if orphans:
+        lines.append(f"_{_ORPHAN_REASON}_")
+        lines.append("")
+        for path in orphans:
+            lines.append(f"- `{_rel(path, repo_root)}`")
+        lines.append("")
+    else:
+        lines.extend(["_None_", ""])
+
+    for key in (STATUS_HIGHLY_OUTDATED, STATUS_POSSIBLY_OUTDATED):
         items = by_status[key]
-        lines.extend([f"### {title} ({len(items)})", ""])
+        lines.extend([f"### {key} ({len(items)})", ""])
         if not items:
             lines.extend(["_None_", ""])
             continue
@@ -705,19 +717,6 @@ def build_locale_report(
         if not detailed:
             lines.append("")
 
-    lines.extend([
-        f"### Orphan localized files, no English source ({len(orphans)})",
-        "",
-    ])
-    if orphans:
-        lines.append(f"_{_ORPHAN_REASON}_")
-        lines.append("")
-        for path in orphans:
-            lines.append(f"- `{_rel(path, repo_root)}`")
-        lines.append("")
-    else:
-        lines.extend(["_None_", ""])
-
     return "\n".join(lines)
 
 def build_index_report(
@@ -728,7 +727,7 @@ def build_index_report(
         "",
         f"Generated: {date}",
         "",
-        "| Locale | Report | Files | highly_outdated | possibly_outdated | up_to_date | Orphans |",
+        f"| Locale | Report | Evaluated | {STATUS_CURRENT} | Orphans | {STATUS_HIGHLY_OUTDATED} | {STATUS_POSSIBLY_OUTDATED} |",
         "|---|---|---:|---:|---:|---:|---:|",
     ]
     for locale, evaluated, orphans in results:
@@ -736,7 +735,7 @@ def build_index_report(
         fname = f"l10n-indicators-{locale}.md"
         lines.append(
             f"| `{locale}` | [{fname}]({fname}) | {len(evaluated)} |"
-            f" {hi} | {poss} | {curr} | {len(orphans)} |"
+            f" {curr} | {len(orphans)} | {hi} | {poss} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -902,8 +901,8 @@ def main() -> None:
         hi, poss, curr = count_files_by_status(evaluated)
         print(
             f"Wrote {out_path}  "
-            f"({hi} highly_outdated, {poss} possibly_outdated, "
-            f"{curr} up_to_date, {len(orphans)} orphans)",
+            f"({len(orphans)} orphans, {hi} {STATUS_HIGHLY_OUTDATED}, "
+            f"{poss} {STATUS_POSSIBLY_OUTDATED}, {curr} {STATUS_CURRENT})",
             file=sys.stderr,
         )
 
