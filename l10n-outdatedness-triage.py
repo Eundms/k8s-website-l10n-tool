@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 # --- Constants ---
+# These thresholds are empirically set per locale; a statistical approach (median+MAD
+# from structurally-clean files) could replace them with auto-calibrated per-locale values.
 _LENGTH_GAP_MIN_EN_LINES = 15      # EN files shorter than this skip all length-gap checks
 _SHORT_EN_THRESHOLD = 40           # below this, length gap requires a companion indicator
 _CJK_SHORT_EN_THRESHOLD = 56       # same guard for CJK (denser text, files run longer)
@@ -112,7 +114,7 @@ _LENGTH_GAP_INDICATORS: FrozenSet[str] = frozenset(
 )
 # Structural indicators (headings, code, anchors, versions, API tokens) —
 # excludes length-gap indicators. Used as the corroboration gate for
-# `small_length_gap` emission and for rule 4 in `classify_file_status`.
+# `small_length_gap` emission and for rule 4 in `classify_status`.
 _NON_LENGTH_INDICATORS: FrozenSet[str] = frozenset({
     "moderate_heading_loss", "severe_heading_loss",
     "moderate_code_loss", "severe_code_loss",
@@ -155,14 +157,6 @@ class FileStats:
     missing_api_or_kind: int = 0
 
 @dataclass
-class FileIndicatorSummary:
-    length_gap_level: str
-    length_gap_reason: str
-    effective_missing_h2: int
-    only_anchor_indicator: bool
-    h2_as_h3_note: str
-
-@dataclass
 class FileReport:
     localized_path: str
     status: str
@@ -196,7 +190,7 @@ def _count_body_words(text: str) -> int:
     t = _STRIP_INLINE.sub("", "\n\n".join(kept))
     return len(_BODY_WORD_RE.findall(t))
 
-def _scan_structure(text: str) -> Tuple[int, int, int, FrozenSet[str]]:
+def _extract_structure(text: str) -> Tuple[int, int, int, FrozenSet[str]]:
     # Strip comments first: zh-cn `<!-- -->` blocks would desync `in_code`.
     # Toggle on 0-3-space fences (CommonMark); only count column-0 fences.
     lines = _STRIP_CMNT.sub("", text).splitlines()
@@ -243,7 +237,7 @@ def parse_markdown(path: str, locale: str = "") -> ParsedFile:
     del locale
     with open(path, encoding="utf-8", errors="replace") as fh:
         text = fh.read()
-    h2, h3, code_blocks, anchors = _scan_structure(text)
+    h2, h3, code_blocks, anchors = _extract_structure(text)
     return ParsedFile(
         visible_lines=_count_visible_lines(text),
         h2=h2, h3=h3, code_blocks=code_blocks,
@@ -256,7 +250,7 @@ def parse_markdown(path: str, locale: str = "") -> ParsedFile:
 
 # --- Stats ---
 
-def _version_minor(v: str) -> int:
+def _parse_version_minor(v: str) -> int:
     m = re.match(r"v1\.(\d+)", v)
     return int(m.group(1)) if m else 0
 
@@ -265,8 +259,8 @@ def _count_missing_new_versions(
 ) -> int:
     if not l10n_versions:
         return len(en_versions)
-    l10n_max = max(_version_minor(v) for v in l10n_versions)
-    return sum(1 for v in en_versions if _version_minor(v) > l10n_max)
+    l10n_max = max(_parse_version_minor(v) for v in l10n_versions)
+    return sum(1 for v in en_versions if _parse_version_minor(v) > l10n_max)
 
 def compute_stats(en: ParsedFile, l10n: ParsedFile) -> FileStats:
     line_ratio = (
@@ -296,7 +290,7 @@ def compute_stats(en: ParsedFile, l10n: ParsedFile) -> FileStats:
         missing_api_or_kind=missing_api_or_kind,
     )
 
-# --- Indicators and suppression checks ---
+# --- Indicators ---
 
 def _classify_length_gap(l10n_to_en_line_ratio: float) -> str:
     if l10n_to_en_line_ratio < 0.50:
@@ -309,7 +303,7 @@ def _classify_length_gap(l10n_to_en_line_ratio: float) -> str:
         return _LENGTH_GAP_SILENT
     return _LENGTH_GAP_NONE
 
-def _length_gap_reason(level: str, l10n_to_en_line_ratio: float) -> str:
+def _build_length_gap_reason(level: str, l10n_to_en_line_ratio: float) -> str:
     if level == _LENGTH_GAP_LARGE:
         inv = (
             f"{1 / l10n_to_en_line_ratio:.1f}×"
@@ -331,7 +325,7 @@ def _length_gap_reason(level: str, l10n_to_en_line_ratio: float) -> str:
         )
     return ""
 
-def _adjust_h2_as_h3(
+def _adjust_zh_cn_heading(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
 ) -> Tuple[int, str]:
     # zh-cn bilingual files sometimes render source H2 as H3 (source heading
@@ -354,7 +348,7 @@ def _adjust_h2_as_h3(
     )
     return effective, note
 
-def _only_length_gap(stats: FileStats) -> bool:
+def _is_only_length_gap(stats: FileStats) -> bool:
     # True when no structural loss is present — only a length gap fired.
     return (stats.missing_h2 == 0
             and stats.missing_h3 == 0
@@ -362,7 +356,7 @@ def _only_length_gap(stats: FileStats) -> bool:
             and stats.missing_anchors == 0
             and stats.missing_new_versions == 0)
 
-def _suppress_gap_short_en(
+def _is_length_gap_unreliable(
     en: ParsedFile, l10n: ParsedFile, locale: str,
     level: str, has_support: bool,
 ) -> bool:
@@ -374,7 +368,7 @@ def _suppress_gap_short_en(
             or (locale in _CJK_LOCALES
                 and en.visible_lines < _CJK_SHORT_EN_THRESHOLD))
 
-def _suppress_gap_ja(
+def _is_ja_length_gap_expected(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile,
     locale: str, level: str,
 ) -> bool:
@@ -384,9 +378,9 @@ def _suppress_gap_ja(
             and l10n.visible_lines > 0
             and locale == "ja"
             and en.visible_lines >= _CJK_SHORT_EN_THRESHOLD
-            and _only_length_gap(stats))
+            and _is_only_length_gap(stats))
 
-def _suppress_gap_latin(
+def _is_latin_length_gap_expected(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile,
     locale: str, level: str,
 ) -> bool:
@@ -397,132 +391,44 @@ def _suppress_gap_latin(
             and l10n.visible_lines > 0
             and locale in _LATIN_COMPACTNESS_LOCALES
             and en.visible_lines >= _LATIN_MIN_EN_LINES
-            and _only_length_gap(stats)
+            and _is_only_length_gap(stats)
             and stats.l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN)
 
-def analyze_file_indicators(
+def build_indicators(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
-) -> FileIndicatorSummary:
-    # Empty-stub bypass on the short-EN floor so empty stubs still reach a level.
-    if en.visible_lines >= _LENGTH_GAP_MIN_EN_LINES or l10n.visible_lines == 0:
-        level = _classify_length_gap(stats.l10n_to_en_line_ratio)
-        length_gap_reason = _length_gap_reason(level, stats.l10n_to_en_line_ratio)
-    else:
-        level, length_gap_reason = _LENGTH_GAP_NONE, ""
-
-    eff_h2, h2_as_h3_note = _adjust_h2_as_h3(stats, en, l10n, locale)
-
-    has_support = (
-        eff_h2 > 0 or stats.missing_h3 > 0
-        or stats.missing_code_blocks > 0 or stats.missing_new_versions > 0
-    )
-
-    only_anchor_indicator = (
-        stats.missing_anchors >= 1
-        and eff_h2 == 0 and stats.missing_h3 == 0
-        and stats.missing_code_blocks == 0
-        and stats.missing_new_versions == 0
-        and not length_gap_reason
-    )
-
-    if _suppress_gap_short_en(en, l10n, locale, level, has_support):
-        level, length_gap_reason = _LENGTH_GAP_NONE, ""
-
-    if _suppress_gap_ja(stats, en, l10n, locale, level):
-        level, length_gap_reason = _LENGTH_GAP_NONE, ""
-
-    if _suppress_gap_latin(stats, en, l10n, locale, level):
-        level, length_gap_reason = _LENGTH_GAP_NONE, ""
-
-    return FileIndicatorSummary(
-        length_gap_level=level,
-        length_gap_reason=length_gap_reason,
-        effective_missing_h2=eff_h2,
-        only_anchor_indicator=only_anchor_indicator,
-        h2_as_h3_note=h2_as_h3_note,
-    )
-
-# --- Reason rendering ---
-
-_ONLY_ANCHOR_INDICATOR_SUFFIX = (
-    " (only indicator — may reflect anchor naming differences, "
-    "typo variants, or structure mismatch; verify manually)"
-)
-
-_FALLBACK_REASON = "Content indicators suggest localized file may be outdated"
-
-def format_file_reasons(
-    stats: FileStats, summary: FileIndicatorSummary,
-) -> List[str]:
-    reasons: List[str] = []
-    if summary.length_gap_reason:
-        reasons.append(summary.length_gap_reason)
-
-    if summary.effective_missing_h2 > 0 or stats.missing_h3 > 0:
-        parts = []
-        if summary.effective_missing_h2:
-            parts.append(f"{summary.effective_missing_h2} H2")
-        if stats.missing_h3:
-            parts.append(f"{stats.missing_h3} H3")
-        reasons.append(
-            f"Localized file is missing headings present in source ({', '.join(parts)})"
-        )
-
-    if summary.h2_as_h3_note:
-        reasons.append(summary.h2_as_h3_note)
-
-    if stats.missing_code_blocks:
-        reasons.append(
-            f"Localized file is missing {stats.missing_code_blocks} "
-            f"code block(s) present in source"
-        )
-
-    if stats.missing_anchors:
-        r = (
-            f"Localized file is missing {stats.missing_anchors} "
-            f"section anchor(s) present in source"
-        )
-        if summary.only_anchor_indicator:
-            r += _ONLY_ANCHOR_INDICATOR_SUFFIX
-        reasons.append(r)
-
-    if stats.missing_new_versions:
-        reasons.append(
-            f"Localized file is missing {stats.missing_new_versions} "
-            f"Kubernetes version reference(s) present in source"
-        )
-
-    if stats.missing_feature_state and stats.missing_api_or_kind:
-        reasons.append(
-            "Content mismatch: feature-state AND apiVersion/kind value(s) "
-            "present in source are missing from localized"
-        )
-
-    return reasons or [_FALLBACK_REASON]
-
-# --- Indicator gathering + classifier ---
-
-def gather_indicators(
-    stats: FileStats, summary: FileIndicatorSummary,
-    en: ParsedFile, l10n: ParsedFile,
 ) -> List[str]:
     indicators: List[str] = []
 
     if l10n.visible_lines == 0 and en.visible_lines >= 1:
         indicators.append("empty_stub")
 
-    if (summary.length_gap_level == _LENGTH_GAP_LARGE
-            and l10n.visible_lines > 0):
+    # Empty-stub bypass on the short-EN floor so empty stubs still reach a level.
+    if en.visible_lines >= _LENGTH_GAP_MIN_EN_LINES or l10n.visible_lines == 0:
+        level = _classify_length_gap(stats.l10n_to_en_line_ratio)
+    else:
+        level = _LENGTH_GAP_NONE
+
+    eff_h2, _ = _adjust_zh_cn_heading(stats, en, l10n, locale)
+
+    has_support = (
+        eff_h2 > 0 or stats.missing_h3 > 0
+        or stats.missing_code_blocks > 0 or stats.missing_new_versions > 0
+    )
+
+    if _is_length_gap_unreliable(en, l10n, locale, level, has_support):
+        level = _LENGTH_GAP_NONE
+    if _is_ja_length_gap_expected(stats, en, l10n, locale, level):
+        level = _LENGTH_GAP_NONE
+    if _is_latin_length_gap_expected(stats, en, l10n, locale, level):
+        level = _LENGTH_GAP_NONE
+
+    if level == _LENGTH_GAP_LARGE and l10n.visible_lines > 0:
         indicators.append("large_length_gap")
-    elif summary.length_gap_level == _LENGTH_GAP_MODERATE:
+    elif level == _LENGTH_GAP_MODERATE:
         indicators.append("moderate_length_gap")
 
-    # Use the H2-as-H3-adjusted count so zh-cn level-shift files aren't
-    # over-promoted to a strong indicator.
-    eff_h2 = summary.effective_missing_h2
     if (eff_h2 >= _STRONG_H2_THRESHOLD
-            or (eff_h2 >= 1
-                and stats.missing_h3 >= _STRONG_H3_WITH_H2_THRESHOLD)):
+            or (eff_h2 >= 1 and stats.missing_h3 >= _STRONG_H3_WITH_H2_THRESHOLD)):
         indicators.append("severe_heading_loss")
     elif eff_h2 >= 1 or stats.missing_h3 >= 2:
         indicators.append("moderate_heading_loss")
@@ -545,9 +451,7 @@ def gather_indicators(
     if stats.missing_feature_state and stats.missing_api_or_kind:
         indicators.append("severe_api_and_feature_mismatch")
 
-    # Emit small_length_gap only with a non-length supporting indicator
-    # or raw missing_feature_state / missing_api_or_kind (gate-only).
-    if (summary.length_gap_level == _LENGTH_GAP_SMALL
+    if (level == _LENGTH_GAP_SMALL
             and l10n.visible_lines > 0
             and (any(ind in _NON_LENGTH_INDICATORS for ind in indicators)
                  or stats.missing_feature_state > 0
@@ -556,7 +460,81 @@ def gather_indicators(
 
     return indicators
 
-def _is_latin_translated_anchor_false_alarm(
+# --- Reason rendering ---
+
+_ONLY_ANCHOR_INDICATOR_SUFFIX = (
+    " (only indicator — may reflect anchor naming differences, "
+    "typo variants, or structure mismatch; verify manually)"
+)
+
+_FALLBACK_REASON = "Content indicators suggest localized file may be outdated"
+
+def build_reasons(
+    stats: FileStats, en: ParsedFile, l10n: ParsedFile,
+    locale: str, indicators: List[str],
+) -> List[str]:
+    reasons: List[str] = []
+    indset = set(indicators)
+
+    if "large_length_gap" in indset:
+        reasons.append(_build_length_gap_reason(_LENGTH_GAP_LARGE, stats.l10n_to_en_line_ratio))
+    elif "moderate_length_gap" in indset:
+        reasons.append(_build_length_gap_reason(_LENGTH_GAP_MODERATE, stats.l10n_to_en_line_ratio))
+    elif "small_length_gap" in indset:
+        reasons.append(_build_length_gap_reason(_LENGTH_GAP_SMALL, stats.l10n_to_en_line_ratio))
+
+    eff_h2, h2_as_h3_note = _adjust_zh_cn_heading(stats, en, l10n, locale)
+    if eff_h2 > 0 or stats.missing_h3 > 0:
+        parts = []
+        if eff_h2:
+            parts.append(f"{eff_h2} H2")
+        if stats.missing_h3:
+            parts.append(f"{stats.missing_h3} H3")
+        reasons.append(
+            f"Localized file is missing headings present in source ({', '.join(parts)})"
+        )
+
+    if h2_as_h3_note:
+        reasons.append(h2_as_h3_note)
+
+    if stats.missing_code_blocks:
+        reasons.append(
+            f"Localized file is missing {stats.missing_code_blocks} "
+            f"code block(s) present in source"
+        )
+
+    if stats.missing_anchors:
+        only_anchor = (
+            eff_h2 == 0 and stats.missing_h3 == 0
+            and stats.missing_code_blocks == 0
+            and stats.missing_new_versions == 0
+            and not (indset & _LENGTH_GAP_INDICATORS)
+        )
+        r = (
+            f"Localized file is missing {stats.missing_anchors} "
+            f"section anchor(s) present in source"
+        )
+        if only_anchor:
+            r += _ONLY_ANCHOR_INDICATOR_SUFFIX
+        reasons.append(r)
+
+    if stats.missing_new_versions:
+        reasons.append(
+            f"Localized file is missing {stats.missing_new_versions} "
+            f"Kubernetes version reference(s) present in source"
+        )
+
+    if stats.missing_feature_state and stats.missing_api_or_kind:
+        reasons.append(
+            "Content mismatch: feature-state AND apiVersion/kind value(s) "
+            "present in source are missing from localized"
+        )
+
+    return reasons or [_FALLBACK_REASON]
+
+# --- Classifier ---
+
+def _is_latin_anchor_expected(
     non_length_gap_supporting: Set[str], locale: str,
     l10n_to_en_body_word_ratio: float, missing_anchors: int,
 ) -> bool:
@@ -571,7 +549,7 @@ def _is_latin_translated_anchor_false_alarm(
         and all(s == "moderate_anchor_loss" for s in non_length_gap_supporting)
     )
 
-def classify_file_status(
+def classify_status(
     indicators: List[str], *,
     locale: str, l10n_to_en_body_word_ratio: float, missing_anchors: int,
 ) -> str:
@@ -604,7 +582,7 @@ def classify_file_status(
         return STATUS_HIGHLY_OUTDATED
     if "large_length_gap" in indset:
         non_length_gap = supporting - _LENGTH_GAP_INDICATORS
-        if non_length_gap and not _is_latin_translated_anchor_false_alarm(
+        if non_length_gap and not _is_latin_anchor_expected(
                 non_length_gap, locale,
                 l10n_to_en_body_word_ratio, missing_anchors):
             return STATUS_HIGHLY_OUTDATED
@@ -637,7 +615,7 @@ def _local_links(rel_path: str, locale: str, output_dir: str, repo_root: str, lo
     pair = f"{loc_link} {en_link}" if locale_first else f"{en_link} {loc_link}"
     return f"  {pair}"
 
-def _make_links(
+def _build_links(
     rel_path: str, locale: str, link_mode: str,
     branch: str, output_dir: str, repo_root: str,
     locale_first: bool = False,
@@ -646,13 +624,13 @@ def _make_links(
         return _local_links(rel_path, locale, output_dir, repo_root, locale_first)
     return _github_links(rel_path, locale, branch, locale_first)
 
-def _rel(path: str, repo_root: str) -> str:
+def _to_rel_path(path: str, repo_root: str) -> str:
     try:
         return os.path.relpath(path, repo_root)
     except ValueError:
         return path
 
-def _doc_area(path: str, locale: str) -> str:
+def _extract_doc_area(path: str, locale: str) -> str:
     m = re.search(rf"content/{re.escape(locale)}/([^/]+(?:/[^/]+)?)", path)
     if not m:
         return "(other)/"
@@ -704,7 +682,7 @@ def build_locale_report(
     ]
 
     area_counts: Counter = Counter(
-        _doc_area(fr.localized_path, locale)
+        _extract_doc_area(fr.localized_path, locale)
         for fr in evaluated
         if fr.status != STATUS_CURRENT
     )
@@ -730,8 +708,8 @@ def build_locale_report(
         lines.append(f"_{_ORPHAN_REASON}_")
         lines.append("")
         for path in orphans:
-            rel = _rel(path, repo_root)
-            links = "\n" + _make_links(rel, locale, link_mode, branch, output_dir, repo_root, locale_first=True) if link_mode else ""
+            rel = _to_rel_path(path, repo_root)
+            links = "\n" + _build_links(rel, locale, link_mode, branch, output_dir, repo_root, locale_first=True) if link_mode else ""
             lines.append(f"- `{rel}`{links}")
         lines.append("")
     else:
@@ -744,9 +722,9 @@ def build_locale_report(
             lines.extend(["_None_", ""])
             continue
         for fr in items:
-            path = _rel(fr.localized_path, repo_root)
+            path = _to_rel_path(fr.localized_path, repo_root)
             links = (
-                "\n" + _make_links(path, locale, link_mode, branch, output_dir, repo_root)
+                "\n" + _build_links(path, locale, link_mode, branch, output_dir, repo_root)
                 if link_mode else ""
             )
             if detailed and fr.reasons:
@@ -791,18 +769,17 @@ def evaluate_file_pair(
     en_path: str, l10n_path: str, locale: str,
 ) -> FileReport:
     en = parse_markdown(en_path)
-    l10n = parse_markdown(l10n_path, locale)
+    l10n = parse_markdown(l10n_path)
     stats = compute_stats(en, l10n)
-    summary = analyze_file_indicators(stats, en, l10n, locale)
-    indicators = gather_indicators(stats, summary, en, l10n)
-    status = classify_file_status(
+    indicators = build_indicators(stats, en, l10n, locale)
+    status = classify_status(
         indicators,
         locale=locale,
         l10n_to_en_body_word_ratio=stats.l10n_to_en_body_word_ratio,
         missing_anchors=stats.missing_anchors,
     )
     reasons = (
-        format_file_reasons(stats, summary)
+        build_reasons(stats, en, l10n, locale, indicators)
         if status != STATUS_CURRENT else []
     )
     return FileReport(
