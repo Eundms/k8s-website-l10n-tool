@@ -66,11 +66,11 @@ classify the localized file as one of:
 
 | Status | Meaning |
 |---|---|
-| `highly_outdated`   | Substantive drift — translate / refresh soon |
-| `possibly_outdated` | Some drift — worth a look, lower urgency |
-| `current`           | No meaningful drift detected |
+| `Outdated`          | Substantive drift — translate / refresh soon |
+| `Possibly outdated` | Some drift — worth a look, lower urgency |
+| `Up to date`        | No meaningful drift detected |
 
-Localized files with no English counterpart are reported separately as
+Localized files with no English source are reported separately as
 **orphans** (likely renamed or removed upstream).
 
 The comparison is lightweight by design — it runs across the full
@@ -107,20 +107,27 @@ Alternatively, keep the script here and point it at your
 From inside a `kubernetes/website` checkout:
 
 ```bash
+# All non-English locales (default when no option is given)
+python3 scripts/l10n-outdatedness-triage.py
+
 # Single locale
 python3 scripts/l10n-outdatedness-triage.py --lang ko
 
-# Multiple locales
-python3 scripts/l10n-outdatedness-triage.py --langs ko,zh-cn,ja
+# Multiple locales (space-separated)
+python3 scripts/l10n-outdatedness-triage.py --lang ko zh-cn ja
 
-# All non-English locales
-python3 scripts/l10n-outdatedness-triage.py --all-langs
+# Explicitly scan all locales
+python3 scripts/l10n-outdatedness-triage.py --all
 
 # Show every indicator per file (default prints one compact line)
-python3 scripts/l10n-outdatedness-triage.py --lang ko --detailed
+python3 scripts/l10n-outdatedness-triage.py --lang ko --verbose
 
 # Write reports somewhere other than the current directory
-python3 scripts/l10n-outdatedness-triage.py --all-langs --output-dir /tmp/l10n
+python3 scripts/l10n-outdatedness-triage.py --output-dir /tmp/l10n
+
+# Add clickable links next to each file entry
+python3 scripts/l10n-outdatedness-triage.py --lang ko --link web    # GitHub URLs
+python3 scripts/l10n-outdatedness-triage.py --lang ko --link local  # local Markdown paths
 ```
 
 From anywhere, with an explicit repo root:
@@ -132,14 +139,19 @@ python3 l10n-outdatedness-triage.py --lang ko --repo-root /path/to/website
 All options:
 
 ```text
---lang CODE          Single locale (e.g. ko)
---langs CODES        Comma-separated locales (e.g. ko,zh-cn,ja)
---all-langs          All locales under content/ except en
---repo-root DIR      Path to kubernetes/website repo root (auto-detected
-                     by walking up from the current directory)
---output-dir DIR     Directory for report files (default: .)
---detailed           Show all reasons per file plus the named indicators
-                     that fired (default: one compact line, first reason)
+--lang CODE [CODE ...]  One or more locales to scan (e.g. --lang ko  or
+                        --lang ko zh-cn ja)
+--all                   All locales under content/ except en (default
+                        when no option is given)
+--repo-root DIR         Path to kubernetes/website repo root (auto-detected
+                        by walking up from the current directory)
+--output-dir, -o DIR    Directory for report files (default: .)
+--verbose, -v           Show all reasons per file plus the named indicators
+                        that fired (default: one compact line, first reason)
+--link MODE             Add [(en)] and [(<locale>)] links after each file
+                        entry. MODE: 'web' for GitHub URLs (opens code view);
+                        'local' for paths relative to the output directory
+--branch BRANCH         Branch for GitHub links when --link web (default: main)
 ```
 
 ---
@@ -151,41 +163,47 @@ by default):
 
 | File | When it is written | Contents |
 |---|---|---|
-| `l10n-indicators-<locale>.md` | Always, one per locale scanned | Status counts, top affected doc areas, per-file entries grouped by status, and a separate orphan section |
-| `l10n-indicators-index.md` | Only when more than one locale is scanned | Roll-up table linking each per-locale report with `highly_outdated` / `possibly_outdated` / `current` / orphan counts |
+| `l10n-status-<locale>.md` | Always, one per locale scanned | Status counts, top affected doc areas, an orphan section, and per-file entries grouped by status |
+| `l10n-status-all.md` | Only when more than one locale is scanned | Roll-up table linking each per-locale report with evaluated / `Up to date` / orphan / `Outdated` / `Possibly outdated` counts |
 
 A per-locale report looks roughly like:
 
 ```markdown
-## Localization status (file-level): `ko`
+## Localization status: `ko`
 
 | Status | Count |
 |---|---:|
-| Evaluated localized files | 412 |
-| highly_outdated   | 11  |
-| possibly_outdated | 24  |
-| current           | 377 |
-| Orphans (no EN)   | 3   |
+| Evaluated         | 412 |
+| Up to date        | 377 |
+| Orphan            | 3   |
+| Outdated          | 11  |
+| Possibly outdated | 24  |
 
-**Top affected areas (non-current files):**
+**Top affected areas (flagged files):**
 - `tasks/`: 9 files
 - `concepts/`: 7 files
 ...
 
-### Highly outdated (11)
-- `content/ko/docs/...md` — highly_outdated: Localized file is missing
-  headings present in EN (3 H2)
+### Orphan localized files, no English source (3)
+- `content/ko/docs/...md`
 ...
 
-### Orphan localized files, no EN counterpart (3)
-- `content/ko/docs/...md`
+### Outdated (11)
+- `content/ko/docs/...md` — Outdated: Localized file is missing
+  headings present in source (3 H2)
 ...
 ```
 
 Default output is one compact line per file with the first reason.
-`--detailed` expands each entry to its full reason list plus the named
+`--verbose` expands each entry to its full reason list plus the named
 indicators that fired, so a reviewer can see exactly which signals
 classified the page.
+
+`--link web` and `--link local` add a second line under each file entry
+with `[(en)]` and `[(<locale>)]` links — `web` points at the source on
+GitHub (defaults to `main`, override with `--branch`), `local` points at
+the Markdown files in your checkout via paths relative to the output
+directory.
 
 ---
 
@@ -202,42 +220,42 @@ back to the indicators that fired.
 
 | Indicator | Trigger |
 |---|---|
-| `empty_stub`           | Localized body empty, EN body non-empty |
-| `severe_heading_loss`  | ≥ 2 H2 missing (or ≥ 1 H2 + ≥ 5 H3 missing) |
-| `major_code_loss`      | ≥ 3 code blocks missing |
-| `heavy_anchor_loss`    | ≥ 5 explicit `{#anchor}` IDs missing |
-| `heavy_version_drift`  | ≥ 3 newer `v1.X` versions referenced in EN are missing |
+| `empty_stub`               | Localized body empty, source body non-empty |
+| `severe_heading_loss`      | ≥ 2 H2 missing (or ≥ 1 H2 + ≥ 5 H3 missing) |
+| `severe_code_loss`         | ≥ 3 code blocks missing |
+| `severe_anchor_loss`       | ≥ 5 explicit `{#anchor}` IDs missing |
+| `severe_version_mismatch`  | ≥ 3 newer `v1.X` versions referenced in source are missing |
 
 **Supporting** (corroborate together):
 
 | Indicator | Trigger |
 |---|---|
-| `large_length_gap`        | l10n-to-EN visible-line ratio < 0.50 |
-| `moderate_length_gap`     | ratio in [0.50, 0.65) |
-| `moderate_heading_loss`   | 1 H2 missing, or 2–4 H3 missing |
-| `moderate_code_loss`      | 1–2 code blocks missing |
-| `moderate_anchor_loss`    | 1–4 explicit anchor IDs missing |
-| `moderate_version_drift`  | 1–2 missing newer `v1.X` versions |
+| `large_length_gap`           | l10n-to-source visible-line ratio < 0.50 |
+| `moderate_length_gap`        | ratio in [0.50, 0.65) |
+| `moderate_heading_loss`      | 1 H2 missing, or 2–4 H3 missing |
+| `moderate_code_loss`         | 1–2 code blocks missing |
+| `moderate_anchor_loss`       | 1–4 explicit anchor IDs missing |
+| `moderate_version_mismatch`  | 1–2 missing newer `v1.X` versions |
 
 **Special signals**:
 
 | Indicator | Role |
 |---|---|
-| `severe_api_and_feature_drift` | Both feature-state AND `apiVersion` / `kind` values present in EN are missing — direct-`highly_outdated` on its own |
-| `small_length_gap` | ratio in [0.65, 0.80), demotion-only — pulls a `current` file to `possibly_outdated`, but only when at least one non-length-gap indicator (or a content-token mismatch) also fires |
+| `severe_api_and_feature_mismatch` | Both feature-state AND `apiVersion` / `kind` values present in source are missing — direct-`Outdated` on its own |
+| `small_length_gap` | ratio in [0.65, 0.80), demotion-only — pulls an `Up to date` file to `Possibly outdated`, but only when at least one non-length-gap indicator (or a content-token mismatch) also fires |
 
 ### Classification rules (in order)
 
 ```
-1. empty_stub or severe_api_and_feature_drift          → highly_outdated
-2. ≥ 2 strong                                          → highly_outdated
-3. ≥ 1 strong + ≥ 1 supporting                         → highly_outdated
-4. large_length_gap + ≥ 1 non-length-gap supporting    → highly_outdated
+1. empty_stub or severe_api_and_feature_mismatch       → Outdated
+2. ≥ 2 strong                                          → Outdated
+3. ≥ 1 strong + ≥ 1 supporting                         → Outdated
+4. large_length_gap + ≥ 1 non-length-gap supporting    → Outdated
    (with Latin translated-anchor false-alarm guard)
-5. ≥ 3 supporting                                      → highly_outdated
-6. ≥ 1 strong OR ≥ 1 supporting                        → possibly_outdated
-7. small_length_gap                                    → possibly_outdated
-8. otherwise                                           → current
+5. ≥ 3 supporting                                      → Outdated
+6. ≥ 1 strong OR ≥ 1 supporting                        → Possibly outdated
+7. small_length_gap                                    → Possibly outdated
+8. otherwise                                           → Up to date
 ```
 
 ### File-shape guards
@@ -281,7 +299,7 @@ why the v2 classifier replaces the older score-based approach, see
 - **Translated anchor IDs.** When a locale translates the anchor ID
   itself (e.g. `{#pourquoi-kubernetes}`), it is flagged as missing even
   though the content is fine. The Latin translated-anchor guard
-  prevents this from promoting a file to `highly_outdated`, but the
+  prevents this from promoting a file to `Outdated`, but the
   anchor still surfaces in the reasons list.
 - **Scope.** File-level triage only — not a translation-quality check
   and not a replacement for human review.
