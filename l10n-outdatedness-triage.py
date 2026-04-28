@@ -90,8 +90,8 @@ _STRONG_ANCHOR_THRESHOLD = 5
 _STRONG_VERSION_THRESHOLD = 3
 
 _STRONG_INDICATORS: FrozenSet[str] = frozenset({
-    "empty_stub", "severe_heading_loss", "major_code_loss",
-    "heavy_anchor_loss", "heavy_version_mismatch",
+    "empty_stub", "severe_heading_loss", "severe_code_loss",
+    "severe_anchor_loss", "severe_version_mismatch",
 })
 _SUPPORTING_INDICATORS: FrozenSet[str] = frozenset({
     "large_length_gap", "moderate_length_gap",
@@ -109,9 +109,9 @@ _LENGTH_GAP_INDICATORS: FrozenSet[str] = frozenset(
 # as evidence (gate-only — never emitted as indicators).
 _NON_LENGTH_INDICATORS: FrozenSet[str] = frozenset({
     "moderate_heading_loss", "severe_heading_loss",
-    "moderate_code_loss", "major_code_loss",
-    "moderate_anchor_loss", "heavy_anchor_loss",
-    "moderate_version_mismatch", "heavy_version_mismatch",
+    "moderate_code_loss", "severe_code_loss",
+    "moderate_anchor_loss", "severe_anchor_loss",
+    "moderate_version_mismatch", "severe_version_mismatch",
     "severe_api_and_feature_mismatch",
 })
 
@@ -521,17 +521,17 @@ def gather_indicators(
         indicators.append("moderate_heading_loss")
 
     if stats.missing_code_blocks >= _STRONG_CODE_THRESHOLD:
-        indicators.append("major_code_loss")
+        indicators.append("severe_code_loss")
     elif stats.missing_code_blocks >= 1:
         indicators.append("moderate_code_loss")
 
     if stats.missing_anchors >= _STRONG_ANCHOR_THRESHOLD:
-        indicators.append("heavy_anchor_loss")
+        indicators.append("severe_anchor_loss")
     elif stats.missing_anchors >= 1:
         indicators.append("moderate_anchor_loss")
 
     if stats.missing_new_versions >= _STRONG_VERSION_THRESHOLD:
-        indicators.append("heavy_version_mismatch")
+        indicators.append("severe_version_mismatch")
     elif stats.missing_new_versions >= 1:
         indicators.append("moderate_version_mismatch")
 
