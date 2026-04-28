@@ -7,13 +7,19 @@ version mismatch, API/feature-state token mismatch) and classifies it as
 `Outdated`, `Possibly outdated`, or `Up to date`.
 
 Usage:
-    # Inside the kubernetes/website repo
-    python3 scripts/l10n-outdatedness-triage.py                            # all locales (default)
+    # all locales (default)
+    python3 scripts/l10n-outdatedness-triage.py
+    # specific locales
     python3 scripts/l10n-outdatedness-triage.py --lang ko
-    python3 scripts/l10n-outdatedness-triage.py --lang ko zh-cn ja
-    python3 scripts/l10n-outdatedness-triage.py --lang ko --verbose --output-dir /tmp/l10n
+    python3 scripts/l10n-outdatedness-triage.py --lang ko ja zh-cn
 
-    # Outside the repo (relative or absolute path to the repo root)
+    # Report generation options
+    python3 scripts/l10n-outdatedness-triage.py --lang ko --verbose
+    python3 scripts/l10n-outdatedness-triage.py --lang ko --output-dir /tmp/l10n
+    python3 scripts/l10n-outdatedness-triage.py --lang ko --link web
+    python3 scripts/l10n-outdatedness-triage.py --lang ko --link local
+
+    # Select kubernetes/website repository root (default: parent directory):
     python3 l10n-outdatedness-triage.py --repo-root ../website
 """
 
@@ -622,6 +628,24 @@ def _github_links(rel_path: str, locale: str, branch: str, locale_first: bool = 
     pair = f"{loc_link} {en_link}" if locale_first else f"{en_link} {loc_link}"
     return f"  {pair}"
 
+def _local_links(rel_path: str, locale: str, output_dir: str, repo_root: str, locale_first: bool = False) -> str:
+    en_rel = re.sub(rf"^content/{re.escape(locale)}/", "content/en/", rel_path)
+    en_path = os.path.relpath(os.path.join(repo_root, en_rel), output_dir)
+    loc_path = os.path.relpath(os.path.join(repo_root, rel_path), output_dir)
+    en_link = f"[(en)]({en_path})"
+    loc_link = f"[({locale})]({loc_path})"
+    pair = f"{loc_link} {en_link}" if locale_first else f"{en_link} {loc_link}"
+    return f"  {pair}"
+
+def _make_links(
+    rel_path: str, locale: str, link_mode: str,
+    branch: str, output_dir: str, repo_root: str,
+    locale_first: bool = False,
+) -> str:
+    if link_mode == "local":
+        return _local_links(rel_path, locale, output_dir, repo_root, locale_first)
+    return _github_links(rel_path, locale, branch, locale_first)
+
 def _rel(path: str, repo_root: str) -> str:
     try:
         return os.path.relpath(path, repo_root)
@@ -654,8 +678,9 @@ def build_locale_report(
     repo_root: str,
     date: str,
     detailed: bool,
-    with_links: bool = False,
+    link_mode: Optional[str] = None,
     branch: str = "main",
+    output_dir: str = ".",
 ) -> str:
     hi, poss, curr = count_files_by_status(evaluated)
     w = max(len(STATUS_HIGHLY_OUTDATED), len(STATUS_POSSIBLY_OUTDATED),
@@ -705,7 +730,7 @@ def build_locale_report(
         lines.append("")
         for path in orphans:
             rel = _rel(path, repo_root)
-            links = "\n" + _github_links(rel, locale, branch, locale_first=True) if with_links else ""
+            links = "\n" + _make_links(rel, locale, link_mode, branch, output_dir, repo_root, locale_first=True) if link_mode else ""
             lines.append(f"- `{rel}`{links}")
         lines.append("")
     else:
@@ -720,8 +745,8 @@ def build_locale_report(
         for fr in items:
             path = _rel(fr.localized_path, repo_root)
             links = (
-                "\n" + _github_links(path, locale, branch)
-                if with_links else ""
+                "\n" + _make_links(path, locale, link_mode, branch, output_dir, repo_root)
+                if link_mode else ""
             )
             if detailed and fr.reasons:
                 lines.append(f"**`{path}`** — status: {fr.status}{links}")
@@ -884,10 +909,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Show all indicator lines per file (default: one compact line)",
     )
     parser.add_argument(
-        "--with-links", action="store_true",
+        "--link", default=None, metavar="MODE", choices=["web", "local"],
         help=(
-            "Add [(en)] and [(<locale>)] GitHub links after each file entry "
-            "(opens code view). Target repo: github.com/kubernetes/website."
+            "Add [(en)] and [(<locale>)] links after each file entry. "
+            "MODE: 'web' for GitHub URLs (opens code view); "
+            "'local' for paths relative to the output directory."
         ),
     )
     parser.add_argument(
@@ -914,6 +940,7 @@ def main() -> None:
     date = datetime.date.today().isoformat()
     locales = _resolve_locales(args, repo_root)
     os.makedirs(args.output_dir, exist_ok=True)
+    abs_output_dir = os.path.abspath(args.output_dir)
 
     all_results: List[Tuple[str, List[FileReport], List[str]]] = []
     for locale in locales:
@@ -926,7 +953,8 @@ def main() -> None:
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(build_locale_report(
                 locale, evaluated, orphans, repo_root, date, args.verbose,
-                with_links=args.with_links, branch=args.branch,
+                link_mode=args.link, branch=args.branch,
+                output_dir=abs_output_dir,
             ))
         hi, poss, curr = count_files_by_status(evaluated)
         print(
