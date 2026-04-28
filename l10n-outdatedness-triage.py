@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""File-level localization outdatedness detector.
+"""Localization outdatedness detector.
 
-Compares each localized Markdown page against its EN counterpart using
+Compares each localized Markdown page against its English source using
 content-based indicators (length gap, missing headings/code/anchors,
-version drift, API/feature-state token drift) and classifies it as
-`highly_outdated`, `possibly_outdated`, or `current`.
+version mismatch, API/feature-state token mismatch) and classifies it as
+`Outdated`, `Possibly outdated`, or `Up to date`.
 
 Usage:
+    # all locales (default)
+    python3 scripts/l10n-outdatedness-triage.py
+    # specific locales
     python3 scripts/l10n-outdatedness-triage.py --lang ko
-    python3 scripts/l10n-outdatedness-triage.py --langs ko,zh-cn,ja
-    python3 scripts/l10n-outdatedness-triage.py --all-langs --output-dir /tmp/l10n
-    python3 scripts/l10n-outdatedness-triage.py --lang ko --detailed
+    python3 scripts/l10n-outdatedness-triage.py --lang ko ja zh-cn
+
+    # Report generation options
+    python3 scripts/l10n-outdatedness-triage.py --lang ko --output-dir /tmp/l10n
+    python3 scripts/l10n-outdatedness-triage.py --lang ko --verbose
+    python3 scripts/l10n-outdatedness-triage.py --lang ko --link web
+    python3 scripts/l10n-outdatedness-triage.py --lang ko --link local
+
+    # Select kubernetes/website repository root (default: parent directory):
+    python3 l10n-outdatedness-triage.py --repo-root ../website
 """
 
 import argparse
@@ -23,13 +33,15 @@ from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 # --- Constants ---
-_LENGTH_GAP_MIN_EN_LINES = 15
-_LENGTH_GAP_REQUIRES_SUPPORT_BELOW_EN_LINES = 40
-_CJK_LENGTH_GAP_REQUIRES_SUPPORT_BELOW_EN_LINES = 56
-_COMPACTNESS_CHECK_MIN_EN_LINES = 55
+# These thresholds are empirically set per locale; a statistical approach (median+MAD
+# from structurally-clean files) could replace them with auto-calibrated per-locale values.
+_LENGTH_GAP_MIN_EN_LINES = 15      # EN files shorter than this skip all length-gap checks
+_SHORT_EN_THRESHOLD = 40           # below this, length gap requires a companion indicator
+_CJK_SHORT_EN_THRESHOLD = 56       # same guard for CJK (denser text, files run longer)
+_LATIN_MIN_EN_LINES = 55           # Latin compactness guard activates only above this
 
-# Empirical gap: Latin false alarms (>=0.94) vs ru drift (<=0.85) at clean shape.
-_FULL_TRANSLATION_BODY_WORD_RATIO_MIN = 0.90
+# Empirical boundary: Latin false alarms sit at >=0.94, real ru mismatch at <=0.85.
+_LATIN_BODY_RATIO_MIN = 0.90       # body-word ratio floor for "full translation" in Latin guard
 
 _LENGTH_GAP_NONE = ""
 _LENGTH_GAP_SILENT = "silent"
@@ -37,11 +49,11 @@ _LENGTH_GAP_SMALL = "small"
 _LENGTH_GAP_MODERATE = "moderate"
 _LENGTH_GAP_LARGE = "large"
 
-_CJK_LANGS: FrozenSet[str] = frozenset({"ko", "ja", "zh-cn", "zh-tw"})
+_CJK_LOCALES: FrozenSet[str] = frozenset({"ko", "ja", "zh-cn", "zh-tw"})
 
-# Latin-script languages whose word counts behave like EN's. Excludes ru:
+# Latin-script locales whose word counts behave like EN's. Excludes ru:
 # real drift at the same pattern sits at notably lower body_word_ratio.
-_LATIN_COMPACTNESS_LANGS: FrozenSet[str] = frozenset(
+_LATIN_COMPACTNESS_LOCALES: FrozenSet[str] = frozenset(
     {"pt-br", "es", "de", "fr", "it"}
 )
 
@@ -71,13 +83,13 @@ _ORPHAN_SKIP_BASENAMES: FrozenSet[str] = frozenset({
     "README.md", "_search.md", "sitemap.md", "_redirects",
 })
 _ORPHAN_REASON = (
-    "No EN counterpart found; verify whether this file was renamed/removed "
-    "upstream or is intentionally language-specific."
+    "No English source found; verify whether this file was renamed/removed "
+    "upstream or is intentionally locale-specific."
 )
 
-STATUS_HIGHLY_OUTDATED = "highly_outdated"
-STATUS_POSSIBLY_OUTDATED = "possibly_outdated"
-STATUS_CURRENT = "current"
+STATUS_HIGHLY_OUTDATED = "Outdated"
+STATUS_POSSIBLY_OUTDATED = "Possibly outdated"
+STATUS_CURRENT = "Up to date"
 
 _STRONG_H2_THRESHOLD = 2
 _STRONG_H3_WITH_H2_THRESHOLD = 5
@@ -86,13 +98,13 @@ _STRONG_ANCHOR_THRESHOLD = 5
 _STRONG_VERSION_THRESHOLD = 3
 
 _STRONG_INDICATORS: FrozenSet[str] = frozenset({
-    "empty_stub", "severe_heading_loss", "major_code_loss",
-    "heavy_anchor_loss", "heavy_version_drift",
+    "empty_stub", "severe_heading_loss", "severe_code_loss",
+    "severe_anchor_loss", "severe_version_mismatch",
 })
 _SUPPORTING_INDICATORS: FrozenSet[str] = frozenset({
     "large_length_gap", "moderate_length_gap",
     "moderate_heading_loss", "moderate_code_loss",
-    "moderate_anchor_loss", "moderate_version_drift",
+    "moderate_anchor_loss", "moderate_version_mismatch",
 })
 # `small_length_gap` is excluded from `_SUPPORTING_INDICATORS`: it only
 # triggers the dedicated possibly_outdated rule, never pairs with strong
@@ -100,15 +112,15 @@ _SUPPORTING_INDICATORS: FrozenSet[str] = frozenset({
 _LENGTH_GAP_INDICATORS: FrozenSet[str] = frozenset(
     {"large_length_gap", "moderate_length_gap", "small_length_gap"}
 )
-# Supporting set for `small_length_gap` emission. `gather_indicators` also
-# accepts raw `missing_feature_state` / `missing_api_or_kind` token counts
-# as evidence (gate-only — never emitted as indicators).
+# Structural indicators (headings, code, anchors, versions, API tokens) —
+# excludes length-gap indicators. Used as the corroboration gate for
+# `small_length_gap` emission and for rule 4 in `classify_status`.
 _NON_LENGTH_INDICATORS: FrozenSet[str] = frozenset({
     "moderate_heading_loss", "severe_heading_loss",
-    "moderate_code_loss", "major_code_loss",
-    "moderate_anchor_loss", "heavy_anchor_loss",
-    "moderate_version_drift", "heavy_version_drift",
-    "severe_api_and_feature_drift",
+    "moderate_code_loss", "severe_code_loss",
+    "moderate_anchor_loss", "severe_anchor_loss",
+    "moderate_version_mismatch", "severe_version_mismatch",
+    "severe_api_and_feature_mismatch",
 })
 
 _STATUS_SORT_KEY = {
@@ -145,14 +157,6 @@ class FileStats:
     missing_api_or_kind: int = 0
 
 @dataclass
-class FileIndicatorSummary:
-    length_gap_level: str
-    length_gap_reason: str
-    effective_missing_h2: int
-    only_anchor_indicator: bool
-    h2_as_h3_note: str
-
-@dataclass
 class FileReport:
     localized_path: str
     status: str
@@ -186,7 +190,7 @@ def _count_body_words(text: str) -> int:
     t = _STRIP_INLINE.sub("", "\n\n".join(kept))
     return len(_BODY_WORD_RE.findall(t))
 
-def _scan_structure(text: str) -> Tuple[int, int, int, FrozenSet[str]]:
+def _extract_structure(text: str) -> Tuple[int, int, int, FrozenSet[str]]:
     # Strip comments first: zh-cn `<!-- -->` blocks would desync `in_code`.
     # Toggle on 0-3-space fences (CommonMark); only count column-0 fences.
     lines = _STRIP_CMNT.sub("", text).splitlines()
@@ -228,12 +232,12 @@ def _extract_api_kind_tokens(text: str) -> FrozenSet[str]:
     tokens.extend(f"kind:{k}" for k in _KIND_LINE_RE.findall(no_cmt))
     return frozenset(tokens)
 
-def parse_markdown(path: str, language: str = "") -> ParsedFile:
-    # `language` is retained for call-site stability; no longer consumed.
-    del language
+def parse_markdown(path: str, locale: str = "") -> ParsedFile:
+    # `locale` is retained for call-site stability; no longer consumed.
+    del locale
     with open(path, encoding="utf-8", errors="replace") as fh:
         text = fh.read()
-    h2, h3, code_blocks, anchors = _scan_structure(text)
+    h2, h3, code_blocks, anchors = _extract_structure(text)
     return ParsedFile(
         visible_lines=_count_visible_lines(text),
         h2=h2, h3=h3, code_blocks=code_blocks,
@@ -246,7 +250,7 @@ def parse_markdown(path: str, language: str = "") -> ParsedFile:
 
 # --- Stats ---
 
-def _version_minor(v: str) -> int:
+def _parse_version_minor(v: str) -> int:
     m = re.match(r"v1\.(\d+)", v)
     return int(m.group(1)) if m else 0
 
@@ -255,8 +259,8 @@ def _count_missing_new_versions(
 ) -> int:
     if not l10n_versions:
         return len(en_versions)
-    l10n_max = max(_version_minor(v) for v in l10n_versions)
-    return sum(1 for v in en_versions if _version_minor(v) > l10n_max)
+    l10n_max = max(_parse_version_minor(v) for v in l10n_versions)
+    return sum(1 for v in en_versions if _parse_version_minor(v) > l10n_max)
 
 def compute_stats(en: ParsedFile, l10n: ParsedFile) -> FileStats:
     line_ratio = (
@@ -286,7 +290,7 @@ def compute_stats(en: ParsedFile, l10n: ParsedFile) -> FileStats:
         missing_api_or_kind=missing_api_or_kind,
     )
 
-# --- Indicators and suppression checks ---
+# --- Indicators ---
 
 def _classify_length_gap(l10n_to_en_line_ratio: float) -> str:
     if l10n_to_en_line_ratio < 0.50:
@@ -299,35 +303,35 @@ def _classify_length_gap(l10n_to_en_line_ratio: float) -> str:
         return _LENGTH_GAP_SILENT
     return _LENGTH_GAP_NONE
 
-def _length_gap_reason(level: str, l10n_to_en_line_ratio: float) -> str:
+def _build_length_gap_reason(level: str, l10n_to_en_line_ratio: float) -> str:
     if level == _LENGTH_GAP_LARGE:
         inv = (
             f"{1 / l10n_to_en_line_ratio:.1f}×"
             if l10n_to_en_line_ratio > 0 else "∞"
         )
         return (
-            f"Localized file is {inv} shorter than EN "
+            f"Localized file is {inv} shorter than EN"
             f"(l10n-to-EN line ratio {l10n_to_en_line_ratio:.2f})"
         )
     if level == _LENGTH_GAP_MODERATE:
         return (
-            f"Localized file is substantially shorter than EN "
+            f"Localized file is substantially shorter than EN"
             f"(l10n-to-EN line ratio {l10n_to_en_line_ratio:.2f})"
         )
     if level == _LENGTH_GAP_SMALL:
         return (
-            f"Localized file is moderately shorter than EN "
+            f"Localized file is moderately shorter than EN"
             f"(l10n-to-EN line ratio {l10n_to_en_line_ratio:.2f})"
         )
     return ""
 
-def _adjust_h2_as_h3(
-    stats: FileStats, en: ParsedFile, l10n: ParsedFile, language: str,
+def _adjust_zh_cn_heading(
+    stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
 ) -> Tuple[int, str]:
-    # zh-cn bilingual files sometimes render EN H2 as H3 (EN heading kept
-    # in a comment). When H3 surplus covers the H2 deficit, count as 1
+    # zh-cn bilingual files sometimes render source H2 as H3 (source heading
+    # kept in a comment). When H3 surplus covers the H2 deficit, count as 1
     # missing H2; predicates guard against genuine small H2 deficits.
-    if not (language == "zh-cn"
+    if not (locale == "zh-cn"
             and stats.missing_h2 >= 3
             and l10n.h3 > en.h3
             and (l10n.h3 - en.h3) >= stats.missing_h2
@@ -339,97 +343,122 @@ def _adjust_h2_as_h3(
     note = (
         f"Possible heading-level mismatch: {suppressed} of {stats.missing_h2} "
         f"apparent missing H2(s) may have been translated as H3(s) in the "
-        f"zh-cn file (zh-cn has {l10n.h3 - en.h3} more H3s than EN) — "
+        f"zh-cn file (zh-cn has {l10n.h3 - en.h3} more H3s than source) — "
         "counted as 1 H2; verify manually"
     )
     return effective, note
 
-def _has_only_length_gap_indicator(stats: FileStats) -> bool:
+def _is_only_length_gap(stats: FileStats) -> bool:
+    # True when no structural loss is present — only a length gap fired.
     return (stats.missing_h2 == 0
             and stats.missing_h3 == 0
             and stats.missing_code_blocks == 0
             and stats.missing_anchors == 0
             and stats.missing_new_versions == 0)
 
-def _should_suppress_length_gap_short_en(
-    en: ParsedFile, l10n: ParsedFile, language: str,
+def _is_length_gap_unreliable(
+    en: ParsedFile, l10n: ParsedFile, locale: str,
     level: str, has_support: bool,
 ) -> bool:
     """Drop length gap when EN<40 (or <56 for CJK) and no heading/code/
-    version indicator backs up the drift."""
+    version indicator backs up the mismatch."""
     if level == _LENGTH_GAP_NONE or l10n.visible_lines == 0 or has_support:
         return False
-    return (en.visible_lines < _LENGTH_GAP_REQUIRES_SUPPORT_BELOW_EN_LINES
-            or (language in _CJK_LANGS
-                and en.visible_lines < _CJK_LENGTH_GAP_REQUIRES_SUPPORT_BELOW_EN_LINES))
+    return (en.visible_lines < _SHORT_EN_THRESHOLD
+            or (locale in _CJK_LOCALES
+                and en.visible_lines < _CJK_SHORT_EN_THRESHOLD))
 
-def _should_suppress_length_gap_ja_only(
+def _is_ja_length_gap_expected(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile,
-    language: str, level: str,
+    locale: str, level: str,
 ) -> bool:
     """JA-only override: drop length gap when no other indicator fires.
     Empirically a false alarm in JA; zh-cn has real drift at this shape."""
     return (level in (_LENGTH_GAP_MODERATE, _LENGTH_GAP_LARGE)
             and l10n.visible_lines > 0
-            and language == "ja"
-            and en.visible_lines >= _CJK_LENGTH_GAP_REQUIRES_SUPPORT_BELOW_EN_LINES
-            and _has_only_length_gap_indicator(stats))
+            and locale == "ja"
+            and en.visible_lines >= _CJK_SHORT_EN_THRESHOLD
+            and _is_only_length_gap(stats))
 
-def _should_suppress_length_gap_latin_compactness(
+def _is_latin_length_gap_expected(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile,
-    language: str, level: str,
+    locale: str, level: str,
 ) -> bool:
     """Latin override: drop length gap when body word volume matches a
     full translation. The 0.90 floor separates loose-wrapped translations
     (>=0.94) from ru drift (<=0.85)."""
     return (level in (_LENGTH_GAP_MODERATE, _LENGTH_GAP_LARGE)
             and l10n.visible_lines > 0
-            and language in _LATIN_COMPACTNESS_LANGS
-            and en.visible_lines >= _COMPACTNESS_CHECK_MIN_EN_LINES
-            and _has_only_length_gap_indicator(stats)
-            and stats.l10n_to_en_body_word_ratio >= _FULL_TRANSLATION_BODY_WORD_RATIO_MIN)
+            and locale in _LATIN_COMPACTNESS_LOCALES
+            and en.visible_lines >= _LATIN_MIN_EN_LINES
+            and _is_only_length_gap(stats)
+            and stats.l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN)
 
-def analyze_file_indicators(
-    stats: FileStats, en: ParsedFile, l10n: ParsedFile, language: str,
-) -> FileIndicatorSummary:
+def build_indicators(
+    stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
+) -> List[str]:
+    indicators: List[str] = []
+
+    if l10n.visible_lines == 0 and en.visible_lines >= 1:
+        indicators.append("empty_stub")
+
     # Empty-stub bypass on the short-EN floor so empty stubs still reach a level.
     if en.visible_lines >= _LENGTH_GAP_MIN_EN_LINES or l10n.visible_lines == 0:
         level = _classify_length_gap(stats.l10n_to_en_line_ratio)
-        length_gap_reason = _length_gap_reason(level, stats.l10n_to_en_line_ratio)
     else:
-        level, length_gap_reason = _LENGTH_GAP_NONE, ""
+        level = _LENGTH_GAP_NONE
 
-    eff_h2, h2_as_h3_note = _adjust_h2_as_h3(stats, en, l10n, language)
+    eff_h2, _ = _adjust_zh_cn_heading(stats, en, l10n, locale)
 
     has_support = (
         eff_h2 > 0 or stats.missing_h3 > 0
         or stats.missing_code_blocks > 0 or stats.missing_new_versions > 0
     )
 
-    only_anchor_indicator = (
-        stats.missing_anchors >= 1
-        and eff_h2 == 0 and stats.missing_h3 == 0
-        and stats.missing_code_blocks == 0
-        and stats.missing_new_versions == 0
-        and not length_gap_reason
-    )
+    if _is_length_gap_unreliable(en, l10n, locale, level, has_support):
+        level = _LENGTH_GAP_NONE
+    if _is_ja_length_gap_expected(stats, en, l10n, locale, level):
+        level = _LENGTH_GAP_NONE
+    if _is_latin_length_gap_expected(stats, en, l10n, locale, level):
+        level = _LENGTH_GAP_NONE
 
-    if _should_suppress_length_gap_short_en(en, l10n, language, level, has_support):
-        level, length_gap_reason = _LENGTH_GAP_NONE, ""
+    if level == _LENGTH_GAP_LARGE and l10n.visible_lines > 0:
+        indicators.append("large_length_gap")
+    elif level == _LENGTH_GAP_MODERATE:
+        indicators.append("moderate_length_gap")
 
-    if _should_suppress_length_gap_ja_only(stats, en, l10n, language, level):
-        level, length_gap_reason = _LENGTH_GAP_NONE, ""
+    if (eff_h2 >= _STRONG_H2_THRESHOLD
+            or (eff_h2 >= 1 and stats.missing_h3 >= _STRONG_H3_WITH_H2_THRESHOLD)):
+        indicators.append("severe_heading_loss")
+    elif eff_h2 >= 1 or stats.missing_h3 >= 2:
+        indicators.append("moderate_heading_loss")
 
-    if _should_suppress_length_gap_latin_compactness(stats, en, l10n, language, level):
-        level, length_gap_reason = _LENGTH_GAP_NONE, ""
+    if stats.missing_code_blocks >= _STRONG_CODE_THRESHOLD:
+        indicators.append("severe_code_loss")
+    elif stats.missing_code_blocks >= 1:
+        indicators.append("moderate_code_loss")
 
-    return FileIndicatorSummary(
-        length_gap_level=level,
-        length_gap_reason=length_gap_reason,
-        effective_missing_h2=eff_h2,
-        only_anchor_indicator=only_anchor_indicator,
-        h2_as_h3_note=h2_as_h3_note,
-    )
+    if stats.missing_anchors >= _STRONG_ANCHOR_THRESHOLD:
+        indicators.append("severe_anchor_loss")
+    elif stats.missing_anchors >= 1:
+        indicators.append("moderate_anchor_loss")
+
+    if stats.missing_new_versions >= _STRONG_VERSION_THRESHOLD:
+        indicators.append("severe_version_mismatch")
+    elif stats.missing_new_versions >= 1:
+        indicators.append("moderate_version_mismatch")
+
+    if stats.missing_feature_state and stats.missing_api_or_kind:
+        indicators.append("severe_api_and_feature_mismatch")
+
+    if (level == _LENGTH_GAP_SMALL
+            and l10n.visible_lines > 0
+            and (any(ind in _NON_LENGTH_INDICATORS for ind in indicators)
+                 or stats.missing_feature_state > 0
+                 or stats.missing_api_or_kind > 0)):
+        indicators.append("small_length_gap")
+
+    return indicators
 
 # --- Reason rendering ---
 
@@ -440,141 +469,101 @@ _ONLY_ANCHOR_INDICATOR_SUFFIX = (
 
 _FALLBACK_REASON = "Content indicators suggest localized file may be outdated"
 
-def format_file_reasons(
-    stats: FileStats, summary: FileIndicatorSummary, language: str,
+def build_reasons(
+    stats: FileStats, en: ParsedFile, l10n: ParsedFile,
+    locale: str, indicators: List[str],
 ) -> List[str]:
     reasons: List[str] = []
-    if summary.length_gap_reason:
-        reasons.append(summary.length_gap_reason)
+    indset = set(indicators)
 
-    if summary.effective_missing_h2 > 0 or stats.missing_h3 > 0:
+    if "large_length_gap" in indset:
+        reasons.append(_build_length_gap_reason(_LENGTH_GAP_LARGE, stats.l10n_to_en_line_ratio))
+    elif "moderate_length_gap" in indset:
+        reasons.append(_build_length_gap_reason(_LENGTH_GAP_MODERATE, stats.l10n_to_en_line_ratio))
+    elif "small_length_gap" in indset:
+        reasons.append(_build_length_gap_reason(_LENGTH_GAP_SMALL, stats.l10n_to_en_line_ratio))
+
+    eff_h2, h2_as_h3_note = _adjust_zh_cn_heading(stats, en, l10n, locale)
+    if eff_h2 > 0 or stats.missing_h3 > 0:
         parts = []
-        if summary.effective_missing_h2:
-            parts.append(f"{summary.effective_missing_h2} H2")
+        if eff_h2:
+            parts.append(f"{eff_h2} H2")
         if stats.missing_h3:
             parts.append(f"{stats.missing_h3} H3")
         reasons.append(
-            f"Localized file is missing headings present in EN ({', '.join(parts)})"
+            f"Localized file is missing headings present in source ({', '.join(parts)})"
         )
 
-    if summary.h2_as_h3_note:
-        reasons.append(summary.h2_as_h3_note)
+    if h2_as_h3_note:
+        reasons.append(h2_as_h3_note)
 
     if stats.missing_code_blocks:
         reasons.append(
             f"Localized file is missing {stats.missing_code_blocks} "
-            f"code block(s) present in EN"
+            f"code block(s) present in source"
         )
 
     if stats.missing_anchors:
+        only_anchor = (
+            eff_h2 == 0 and stats.missing_h3 == 0
+            and stats.missing_code_blocks == 0
+            and stats.missing_new_versions == 0
+            and not (indset & _LENGTH_GAP_INDICATORS)
+        )
         r = (
             f"Localized file is missing {stats.missing_anchors} "
-            f"section anchor(s) present in EN"
+            f"section anchor(s) present in source"
         )
-        if summary.only_anchor_indicator:
+        if only_anchor:
             r += _ONLY_ANCHOR_INDICATOR_SUFFIX
         reasons.append(r)
 
     if stats.missing_new_versions:
         reasons.append(
             f"Localized file is missing {stats.missing_new_versions} "
-            f"Kubernetes version reference(s) present in EN"
+            f"Kubernetes version reference(s) present in source"
         )
 
     if stats.missing_feature_state and stats.missing_api_or_kind:
         reasons.append(
-            "Content drift: feature-state AND apiVersion/kind value(s) "
-            "present in EN are missing from localized"
+            "Content mismatch: feature-state AND apiVersion/kind value(s) "
+            "present in source are missing from localized"
         )
 
     return reasons or [_FALLBACK_REASON]
 
-# --- Indicator gathering + classifier ---
+# --- Classifier ---
 
-def gather_indicators(
-    stats: FileStats, summary: FileIndicatorSummary,
-    en: ParsedFile, l10n: ParsedFile,
-) -> List[str]:
-    indicators: List[str] = []
-
-    if l10n.visible_lines == 0 and en.visible_lines >= 1:
-        indicators.append("empty_stub")
-
-    if (summary.length_gap_level == _LENGTH_GAP_LARGE
-            and l10n.visible_lines > 0):
-        indicators.append("large_length_gap")
-    elif summary.length_gap_level == _LENGTH_GAP_MODERATE:
-        indicators.append("moderate_length_gap")
-
-    # Use the H2-as-H3-adjusted count so zh-cn level-shift files aren't
-    # over-promoted to a strong indicator.
-    eff_h2 = summary.effective_missing_h2
-    if (eff_h2 >= _STRONG_H2_THRESHOLD
-            or (eff_h2 >= 1
-                and stats.missing_h3 >= _STRONG_H3_WITH_H2_THRESHOLD)):
-        indicators.append("severe_heading_loss")
-    elif eff_h2 >= 1 or stats.missing_h3 >= 2:
-        indicators.append("moderate_heading_loss")
-
-    if stats.missing_code_blocks >= _STRONG_CODE_THRESHOLD:
-        indicators.append("major_code_loss")
-    elif stats.missing_code_blocks >= 1:
-        indicators.append("moderate_code_loss")
-
-    if stats.missing_anchors >= _STRONG_ANCHOR_THRESHOLD:
-        indicators.append("heavy_anchor_loss")
-    elif stats.missing_anchors >= 1:
-        indicators.append("moderate_anchor_loss")
-
-    if stats.missing_new_versions >= _STRONG_VERSION_THRESHOLD:
-        indicators.append("heavy_version_drift")
-    elif stats.missing_new_versions >= 1:
-        indicators.append("moderate_version_drift")
-
-    if stats.missing_feature_state and stats.missing_api_or_kind:
-        indicators.append("severe_api_and_feature_drift")
-
-    # Emit small_length_gap only with a non-length supporting indicator
-    # or raw missing_feature_state / missing_api_or_kind (gate-only).
-    if (summary.length_gap_level == _LENGTH_GAP_SMALL
-            and l10n.visible_lines > 0
-            and (any(ind in _NON_LENGTH_INDICATORS for ind in indicators)
-                 or stats.missing_feature_state > 0
-                 or stats.missing_api_or_kind > 0)):
-        indicators.append("small_length_gap")
-
-    return indicators
-
-def _is_latin_translated_anchor_false_alarm(
-    non_length_gap_supporting: Set[str], language: str,
+def _is_latin_anchor_expected(
+    non_length_gap_supporting: Set[str], locale: str,
     l10n_to_en_body_word_ratio: float, missing_anchors: int,
 ) -> bool:
-    # Some Latin languages translate anchor IDs instead of preserving the
-    # EN identifier — looks compact with a small anchor mismatch but carries
-    # full word volume. Without this guard, rule 4 falsely promotes them.
+    # Some Latin locales translate anchor IDs instead of preserving the
+    # source identifier — looks compact with a small anchor mismatch but
+    # carries full word volume. Without this guard, rule 4 falsely promotes them.
     return (
-        language in _LATIN_COMPACTNESS_LANGS
-        and l10n_to_en_body_word_ratio >= _FULL_TRANSLATION_BODY_WORD_RATIO_MIN
+        locale in _LATIN_COMPACTNESS_LOCALES
+        and l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN
         and missing_anchors <= 2
         and len(non_length_gap_supporting) >= 1
         and all(s == "moderate_anchor_loss" for s in non_length_gap_supporting)
     )
 
-def classify_file_status(
+def classify_status(
     indicators: List[str], *,
-    language: str, l10n_to_en_body_word_ratio: float, missing_anchors: int,
+    locale: str, l10n_to_en_body_word_ratio: float, missing_anchors: int,
 ) -> str:
     """Classification rules, in order:
 
-    1. `empty_stub` or `severe_api_and_feature_drift` → highly_outdated.
-    2. ≥2 strong → highly_outdated.
-    3. ≥1 strong + ≥1 supporting → highly_outdated.
-    4. `large_length_gap` + ≥1 non-length-gap supporting → highly_outdated
+    1. `empty_stub` or `severe_api_and_feature_mismatch` → Outdated.
+    2. ≥2 strong → Outdated.
+    3. ≥1 strong + ≥1 supporting → Outdated.
+    4. `large_length_gap` + ≥1 non-length-gap supporting → Outdated
        (guarded against the Latin translated-anchor false-alarm).
-    5. ≥3 supporting → highly_outdated.
-    6. ≥1 strong or ≥1 supporting → possibly_outdated.
-    7. `small_length_gap` → possibly_outdated.
-    8. Otherwise → current.
+    5. ≥3 supporting → Outdated.
+    6. ≥1 strong or ≥1 supporting → Possibly outdated.
+    7. `small_length_gap` → Possibly outdated.
+    8. Otherwise → Up to date.
     """
     if not indicators:
         return STATUS_CURRENT
@@ -585,7 +574,7 @@ def classify_file_status(
 
     if "empty_stub" in indset:
         return STATUS_HIGHLY_OUTDATED
-    if "severe_api_and_feature_drift" in indset:
+    if "severe_api_and_feature_mismatch" in indset:
         return STATUS_HIGHLY_OUTDATED
     if len(strong) >= 2:
         return STATUS_HIGHLY_OUTDATED
@@ -593,8 +582,8 @@ def classify_file_status(
         return STATUS_HIGHLY_OUTDATED
     if "large_length_gap" in indset:
         non_length_gap = supporting - _LENGTH_GAP_INDICATORS
-        if non_length_gap and not _is_latin_translated_anchor_false_alarm(
-                non_length_gap, language,
+        if non_length_gap and not _is_latin_anchor_expected(
+                non_length_gap, locale,
                 l10n_to_en_body_word_ratio, missing_anchors):
             return STATUS_HIGHLY_OUTDATED
     if len(supporting) >= 3:
@@ -607,14 +596,42 @@ def classify_file_status(
 
 # --- Report formatting ---
 
-def _rel(path: str, repo_root: str) -> str:
+_GITHUB_BASE = "https://github.com/kubernetes/website/blob"
+
+def _github_links(rel_path: str, locale: str, branch: str, locale_first: bool = False) -> str:
+    en_path = re.sub(rf"^content/{re.escape(locale)}/", "content/en/", rel_path)
+    base = f"{_GITHUB_BASE}/{branch}"
+    en_link = f"[(en)]({base}/{en_path}?plain=1)"
+    loc_link = f"[({locale})]({base}/{rel_path}?plain=1)"
+    pair = f"{loc_link} {en_link}" if locale_first else f"{en_link} {loc_link}"
+    return f"  {pair}"
+
+def _local_links(rel_path: str, locale: str, output_dir: str, repo_root: str, locale_first: bool = False) -> str:
+    en_rel = re.sub(rf"^content/{re.escape(locale)}/", "content/en/", rel_path)
+    en_path = os.path.relpath(os.path.join(repo_root, en_rel), output_dir)
+    loc_path = os.path.relpath(os.path.join(repo_root, rel_path), output_dir)
+    en_link = f"[(en)]({en_path})"
+    loc_link = f"[({locale})]({loc_path})"
+    pair = f"{loc_link} {en_link}" if locale_first else f"{en_link} {loc_link}"
+    return f"  {pair}"
+
+def _build_links(
+    rel_path: str, locale: str, link_mode: str,
+    branch: str, output_dir: str, repo_root: str,
+    locale_first: bool = False,
+) -> str:
+    if link_mode == "local":
+        return _local_links(rel_path, locale, output_dir, repo_root, locale_first)
+    return _github_links(rel_path, locale, branch, locale_first)
+
+def _to_rel_path(path: str, repo_root: str) -> str:
     try:
         return os.path.relpath(path, repo_root)
     except ValueError:
         return path
 
-def _doc_area(path: str, language: str) -> str:
-    m = re.search(rf"content/{re.escape(language)}/([^/]+(?:/[^/]+)?)", path)
+def _extract_doc_area(path: str, locale: str) -> str:
+    m = re.search(rf"content/{re.escape(locale)}/([^/]+(?:/[^/]+)?)", path)
     if not m:
         return "(other)/"
     seg = m.group(1)
@@ -632,39 +649,45 @@ def count_files_by_status(
         c[STATUS_CURRENT],
     )
 
-def build_language_report(
-    language: str,
+def build_locale_report(
+    locale: str,
     evaluated: List[FileReport],
     orphans: List[str],
     repo_root: str,
     date: str,
     detailed: bool,
+    link_mode: Optional[str] = None,
+    branch: str = "main",
+    output_dir: str = ".",
 ) -> str:
     hi, poss, curr = count_files_by_status(evaluated)
+    total = len(evaluated) + len(orphans)
+    w = max(len(STATUS_HIGHLY_OUTDATED), len(STATUS_POSSIBLY_OUTDATED),
+            len(STATUS_CURRENT), len("Evaluated"), len("Orphan"))
     lines: List[str] = [
-        f"## Localization status (file-level): `{language}`",
+        f"## Localization status: `{locale}`",
         "",
         f"Generated: {date}  ",
-        "Method: content-based indicators only (file-status classifier; compact reports)  ",
+        "Method: content-based indicators only  ",
         "Script: `l10n-outdatedness-triage.py`",
         "",
         "| Status | Count |",
         "|---|---:|",
-        f"| Evaluated localized files | {len(evaluated)} |",
-        f"| highly_outdated   | {hi} |",
-        f"| possibly_outdated | {poss} |",
-        f"| current           | {curr} |",
-        f"| Orphans (no EN)   | {len(orphans)} |",
+        f"| {'Evaluated':<{w}} | {total} |",
+        f"| {STATUS_CURRENT:<{w}} | {curr} |",
+        f"| {'Orphan':<{w}} | {len(orphans)} |",
+        f"| {STATUS_HIGHLY_OUTDATED:<{w}} | {hi} |",
+        f"| {STATUS_POSSIBLY_OUTDATED:<{w}} | {poss} |",
         "",
     ]
 
     area_counts: Counter = Counter(
-        _doc_area(fr.localized_path, language)
+        _extract_doc_area(fr.localized_path, locale)
         for fr in evaluated
         if fr.status != STATUS_CURRENT
     )
     if area_counts:
-        lines.extend(["**Top affected areas (non-current files):**", ""])
+        lines.extend(["**Top affected areas (flagged files):**", ""])
         for area, count in area_counts.most_common(8):
             lines.append(f"- `{area}`: {count} files")
         lines.append("")
@@ -677,41 +700,44 @@ def build_language_report(
     for fr in evaluated:
         by_status[fr.status].append(fr)
 
-    for title, key in (
-        ("Highly outdated", STATUS_HIGHLY_OUTDATED),
-        ("Possibly outdated", STATUS_POSSIBLY_OUTDATED),
-    ):
-        items = by_status[key]
-        lines.extend([f"### {title} ({len(items)})", ""])
-        if not items:
-            lines.extend(["_None_", ""])
-            continue
-        for fr in items:
-            path = _rel(fr.localized_path, repo_root)
-            if detailed and fr.reasons:
-                lines.append(f"**`{path}`** — status: {fr.status}")
-                lines.extend(f"- {r}" for r in fr.reasons)
-                if fr.indicators:
-                    lines.append(f"- Indicators: {', '.join(fr.indicators)}")
-                lines.append("")
-            else:
-                first = fr.reasons[0] if fr.reasons else "(no indicators)"
-                lines.append(f"- `{path}` — {fr.status}: {first}")
-        if not detailed:
-            lines.append("")
-
     lines.extend([
-        f"### Orphan localized files, no EN counterpart ({len(orphans)})",
+        f"### Orphan localized files, no English source ({len(orphans)})",
         "",
     ])
     if orphans:
         lines.append(f"_{_ORPHAN_REASON}_")
         lines.append("")
         for path in orphans:
-            lines.append(f"- `{_rel(path, repo_root)}`")
+            rel = _to_rel_path(path, repo_root)
+            links = "\n" + _build_links(rel, locale, link_mode, branch, output_dir, repo_root, locale_first=True) if link_mode else ""
+            lines.append(f"- `{rel}`{links}")
         lines.append("")
     else:
         lines.extend(["_None_", ""])
+
+    for key in (STATUS_HIGHLY_OUTDATED, STATUS_POSSIBLY_OUTDATED):
+        items = by_status[key]
+        lines.extend([f"### {key} ({len(items)})", ""])
+        if not items:
+            lines.extend(["_None_", ""])
+            continue
+        for fr in items:
+            path = _to_rel_path(fr.localized_path, repo_root)
+            links = (
+                "\n" + _build_links(path, locale, link_mode, branch, output_dir, repo_root)
+                if link_mode else ""
+            )
+            if detailed and fr.reasons:
+                lines.append(f"**`{path}`** — status: {fr.status}{links}")
+                lines.extend(f"- {r}" for r in fr.reasons)
+                if fr.indicators:
+                    lines.append(f"- Indicators: {', '.join(fr.indicators)}")
+                lines.append("")
+            else:
+                first = fr.reasons[0] if fr.reasons else "(no indicators)"
+                lines.append(f"- `{path}` — {fr.status}: {first}{links}")
+        if not detailed:
+            lines.append("")
 
     return "\n".join(lines)
 
@@ -719,19 +745,20 @@ def build_index_report(
     results: List[Tuple[str, List[FileReport], List[str]]], date: str,
 ) -> str:
     lines = [
-        "## Localization file-level status index",
+        "## Localization status index",
         "",
         f"Generated: {date}",
         "",
-        "| Language | Report | Files | highly_outdated | possibly_outdated | current | Orphans |",
+        f"| Locale | Report | Evaluated | {STATUS_CURRENT} | Orphan | {STATUS_HIGHLY_OUTDATED} | {STATUS_POSSIBLY_OUTDATED} |",
         "|---|---|---:|---:|---:|---:|---:|",
     ]
-    for language, evaluated, orphans in results:
+    for locale, evaluated, orphans in results:
         hi, poss, curr = count_files_by_status(evaluated)
-        fname = f"l10n-indicators-{language}.md"
+        total = len(evaluated) + len(orphans)
+        fname = f"l10n-status-{locale}.md"
         lines.append(
-            f"| `{language}` | [{fname}]({fname}) | {len(evaluated)} |"
-            f" {hi} | {poss} | {curr} | {len(orphans)} |"
+            f"| `{locale}` | [{fname}]({fname}) | {total} |"
+            f" {curr} | {len(orphans)} | {hi} | {poss} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -739,21 +766,20 @@ def build_index_report(
 # --- CLI / orchestration ---
 
 def evaluate_file_pair(
-    en_path: str, l10n_path: str, language: str,
+    en_path: str, l10n_path: str, locale: str,
 ) -> FileReport:
     en = parse_markdown(en_path)
-    l10n = parse_markdown(l10n_path, language)
+    l10n = parse_markdown(l10n_path)
     stats = compute_stats(en, l10n)
-    summary = analyze_file_indicators(stats, en, l10n, language)
-    indicators = gather_indicators(stats, summary, en, l10n)
-    status = classify_file_status(
+    indicators = build_indicators(stats, en, l10n, locale)
+    status = classify_status(
         indicators,
-        language=language,
+        locale=locale,
         l10n_to_en_body_word_ratio=stats.l10n_to_en_body_word_ratio,
         missing_anchors=stats.missing_anchors,
     )
     reasons = (
-        format_file_reasons(stats, summary, language)
+        build_reasons(stats, en, l10n, locale, indicators)
         if status != STATUS_CURRENT else []
     )
     return FileReport(
@@ -763,24 +789,24 @@ def evaluate_file_pair(
         indicators=indicators,
     )
 
-def _is_candidate_orphan(l10n_path: str, language: str) -> bool:
+def _is_candidate_orphan(l10n_path: str, locale: str) -> bool:
     fname = os.path.basename(l10n_path)
     if fname in _ORPHAN_SKIP_BASENAMES:
         return False
-    rel = l10n_path.split(f"content/{language}/", 1)[-1]
+    rel = l10n_path.split(f"content/{locale}/", 1)[-1]
     return rel.startswith("docs/")
 
-def scan_language(
-    language: str, repo_root: str,
+def scan_locale(
+    locale: str, repo_root: str,
 ) -> Tuple[List[FileReport], List[str]]:
-    language_dir = os.path.join(repo_root, "content", language)
-    if not os.path.isdir(language_dir):
-        print(f"error: language directory not found: {language_dir}", file=sys.stderr)
+    locale_dir = os.path.join(repo_root, "content", locale)
+    if not os.path.isdir(locale_dir):
+        print(f"error: locale directory not found: {locale_dir}", file=sys.stderr)
         sys.exit(1)
 
     pairs: List[Tuple[str, str]] = []
     orphan_paths: List[str] = []
-    for root, _, files in os.walk(language_dir):
+    for root, _, files in os.walk(locale_dir):
         for fname in sorted(files):
             if not fname.endswith(".md"):
                 continue
@@ -788,18 +814,18 @@ def scan_language(
             en_path = re.sub(r"content/[^/]+/", "content/en/", l10n_path)
             if os.path.exists(en_path):
                 pairs.append((en_path, l10n_path))
-            elif _is_candidate_orphan(l10n_path, language):
+            elif _is_candidate_orphan(l10n_path, locale):
                 orphan_paths.append(l10n_path)
 
     reports: List[FileReport] = []
 
     total = len(pairs)
     if total:
-        print(f"  [{language}] evaluating {total} file pairs ...", file=sys.stderr)
+        print(f"  [{locale}] evaluating {total} file pairs ...", file=sys.stderr)
     for i, (en_path, l10n_path) in enumerate(pairs, 1):
         if i % 100 == 0:
-            print(f"  [{language}] {i}/{total}", file=sys.stderr)
-        reports.append(evaluate_file_pair(en_path, l10n_path, language))
+            print(f"  [{locale}] {i}/{total}", file=sys.stderr)
+        reports.append(evaluate_file_pair(en_path, l10n_path, locale))
 
     reports.sort(
         key=lambda fr: (_STATUS_SORT_KEY[fr.status], fr.localized_path)
@@ -817,11 +843,9 @@ def _auto_detect_repo_root() -> Optional[str]:
             return None
         d = parent
 
-def _resolve_languages(args: argparse.Namespace, repo_root: str) -> List[str]:
+def _resolve_locales(args: argparse.Namespace, repo_root: str) -> List[str]:
     if args.lang:
-        return [args.lang]
-    if args.langs:
-        return [code.strip() for code in args.langs.split(",") if code.strip()]
+        return args.lang
     content_dir = os.path.join(repo_root, "content")
     return sorted(
         d for d in os.listdir(content_dir)
@@ -831,35 +855,49 @@ def _resolve_languages(args: argparse.Namespace, repo_root: str) -> List[str]:
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "File-level localization outdatedness detector. Classifies "
-            "files by status using content-based indicators and emits "
-            "compact reports; orphan localized docs are integrated as "
-            "possibly_outdated."
+            "Localization outdatedness detector. Classifies "
+            "localized files by status using content-based indicators "
+            "and emits compact reports; orphan localized docs are "
+            "listed in a separate section."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--lang", metavar="CODE", help="Single language (e.g. ko)")
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument(
-        "--langs", metavar="CODES",
-        help="Comma-separated languages (e.g. ko,zh-cn,ja)",
+        "--lang", metavar="CODE", nargs="+",
+        help="One or more locales to scan (e.g. --lang ko  or  --lang ko zh-cn ja)",
     )
     group.add_argument(
-        "--all-langs", action="store_true",
-        help="All languages under content/ except en",
+        "--all", action="store_true",
+        help="Scan all locales under content/ except en (default when no option given)",
     )
     parser.add_argument(
         "--repo-root", default=None, metavar="DIR",
-        help="Path to kubernetes/website repo root (auto-detected if omitted)",
+        help=(
+            "Path to kubernetes/website repo root (auto-detected if omitted). "
+            "Accepts relative paths, e.g. --repo-root ../website"
+        ),
     )
     parser.add_argument(
-        "--output-dir", default=".", metavar="DIR",
-        help="Directory for report files (default: .)",
+        "--output-dir", "-o", default=".", metavar="DIR",
+        help="Directory for report files (default: current directory)",
     )
     parser.add_argument(
-        "--detailed", action="store_true",
+        "--verbose", "-v", action="store_true",
         help="Show all indicator lines per file (default: one compact line)",
+    )
+    parser.add_argument(
+        "--link", default=None, metavar="MODE", choices=["web", "local"],
+        help=(
+            "Add [(en)] and [(<locale>)] links after each file entry. "
+            "MODE: 'web' for GitHub URLs (opens code view); "
+            "'local' for paths relative to the output directory."
+        ),
+    )
+    parser.add_argument(
+        "--branch", default="main", metavar="BRANCH",
+        help="Branch for GitHub links (default: main)",
     )
     return parser
 
@@ -879,31 +917,34 @@ def main() -> None:
             sys.exit(1)
 
     date = datetime.date.today().isoformat()
-    languages = _resolve_languages(args, repo_root)
+    locales = _resolve_locales(args, repo_root)
     os.makedirs(args.output_dir, exist_ok=True)
+    abs_output_dir = os.path.abspath(args.output_dir)
 
     all_results: List[Tuple[str, List[FileReport], List[str]]] = []
-    for language in languages:
-        print(f"Scanning content/{language}/ ...", file=sys.stderr)
-        evaluated, orphans = scan_language(language, repo_root)
-        all_results.append((language, evaluated, orphans))
+    for locale in locales:
+        print(f"Scanning content/{locale}/ ...", file=sys.stderr)
+        evaluated, orphans = scan_locale(locale, repo_root)
+        all_results.append((locale, evaluated, orphans))
         out_path = os.path.join(
-            args.output_dir, f"l10n-indicators-{language}.md"
+            args.output_dir, f"l10n-status-{locale}.md"
         )
         with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write(build_language_report(
-                language, evaluated, orphans, repo_root, date, args.detailed,
+            fh.write(build_locale_report(
+                locale, evaluated, orphans, repo_root, date, args.verbose,
+                link_mode=args.link, branch=args.branch,
+                output_dir=abs_output_dir,
             ))
         hi, poss, curr = count_files_by_status(evaluated)
         print(
             f"Wrote {out_path}  "
-            f"({hi} highly_outdated, {poss} possibly_outdated, "
-            f"{curr} current, {len(orphans)} orphans)",
+            f"({len(orphans)} orphans, {hi} {STATUS_HIGHLY_OUTDATED}, "
+            f"{poss} {STATUS_POSSIBLY_OUTDATED}, {curr} {STATUS_CURRENT})",
             file=sys.stderr,
         )
 
-    if len(languages) > 1:
-        index_path = os.path.join(args.output_dir, "l10n-indicators-index.md")
+    if len(locales) > 1:
+        index_path = os.path.join(args.output_dir, "l10n-status-all.md")
         with open(index_path, "w", encoding="utf-8") as fh:
             fh.write(build_index_report(all_results, date))
         print(f"Wrote {index_path}", file=sys.stderr)
