@@ -7,10 +7,15 @@ version drift, API/feature-state token drift) and classifies it as
 `highly_outdated`, `possibly_outdated`, or `current`.
 
 Usage:
+    # Inside the kubernetes/website repo:
+    python3 scripts/l10n-outdatedness-triage.py                            # all locales (default)
     python3 scripts/l10n-outdatedness-triage.py --lang ko
-    python3 scripts/l10n-outdatedness-triage.py --langs ko,zh-cn,ja
-    python3 scripts/l10n-outdatedness-triage.py --all-langs --output-dir /tmp/l10n
-    python3 scripts/l10n-outdatedness-triage.py --lang ko --detailed
+    python3 scripts/l10n-outdatedness-triage.py --lang ko zh-cn ja
+    python3 scripts/l10n-outdatedness-triage.py --lang ko --verbose --output-dir /tmp/l10n
+
+    # Outside the repo (relative or absolute path to the repo root):
+    python3 l10n-outdatedness-triage.py --repo-root ../website
+    python3 l10n-outdatedness-triage.py --lang ko zh-cn ja --repo-root /path/to/website --output-dir /tmp/l10n
 """
 
 import argparse
@@ -819,9 +824,7 @@ def _auto_detect_repo_root() -> Optional[str]:
 
 def _resolve_languages(args: argparse.Namespace, repo_root: str) -> List[str]:
     if args.lang:
-        return [args.lang]
-    if args.langs:
-        return [code.strip() for code in args.langs.split(",") if code.strip()]
+        return args.lang
     content_dir = os.path.join(repo_root, "content")
     return sorted(
         d for d in os.listdir(content_dir)
@@ -839,26 +842,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--lang", metavar="CODE", help="Single language (e.g. ko)")
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument(
-        "--langs", metavar="CODES",
-        help="Comma-separated languages (e.g. ko,zh-cn,ja)",
+        "--lang", metavar="CODE", nargs="+",
+        help="One or more locales to scan (e.g. --lang ko  or  --lang ko zh-cn ja)",
     )
     group.add_argument(
-        "--all-langs", action="store_true",
-        help="All languages under content/ except en",
+        "--all", action="store_true",
+        help="Scan all locales under content/ except en (default when no option given)",
     )
     parser.add_argument(
         "--repo-root", default=None, metavar="DIR",
-        help="Path to kubernetes/website repo root (auto-detected if omitted)",
+        help=(
+            "Path to kubernetes/website repo root (auto-detected if omitted). "
+            "Accepts relative paths, e.g. --repo-root ../website"
+        ),
     )
     parser.add_argument(
-        "--output-dir", default=".", metavar="DIR",
-        help="Directory for report files (default: .)",
+        "--output-dir", "-o", default=".", metavar="DIR",
+        help="Directory for report files (default: current directory)",
     )
     parser.add_argument(
-        "--detailed", action="store_true",
+        "--verbose", "-v", action="store_true",
         help="Show all indicator lines per file (default: one compact line)",
     )
     return parser
@@ -892,7 +897,7 @@ def main() -> None:
         )
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(build_language_report(
-                language, evaluated, orphans, repo_root, date, args.detailed,
+                language, evaluated, orphans, repo_root, date, args.verbose,
             ))
         hi, poss, curr = count_files_by_status(evaluated)
         print(
