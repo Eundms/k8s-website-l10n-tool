@@ -27,13 +27,13 @@ from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 # --- Constants ---
-_LENGTH_GAP_MIN_EN_LINES = 15
-_LENGTH_GAP_REQUIRES_SUPPORT_BELOW_EN_LINES = 40
-_CJK_LENGTH_GAP_REQUIRES_SUPPORT_BELOW_EN_LINES = 56
-_COMPACTNESS_CHECK_MIN_EN_LINES = 55
+_LENGTH_GAP_MIN_EN_LINES = 15      # EN files shorter than this skip all length-gap checks
+_SHORT_EN_THRESHOLD = 40           # below this, length gap requires a companion indicator
+_CJK_SHORT_EN_THRESHOLD = 56       # same guard for CJK (denser text, files run longer)
+_LATIN_MIN_EN_LINES = 55           # Latin compactness guard activates only above this
 
-# Empirical gap: Latin false alarms (>=0.94) vs ru drift (<=0.85) at clean shape.
-_FULL_TRANSLATION_BODY_WORD_RATIO_MIN = 0.90
+# Empirical boundary: Latin false alarms sit at >=0.94, real ru mismatch at <=0.85.
+_LATIN_BODY_RATIO_MIN = 0.90       # body-word ratio floor for "full translation" in Latin guard
 
 _LENGTH_GAP_NONE = ""
 _LENGTH_GAP_SILENT = "silent"
@@ -104,9 +104,9 @@ _SUPPORTING_INDICATORS: FrozenSet[str] = frozenset({
 _LENGTH_GAP_INDICATORS: FrozenSet[str] = frozenset(
     {"large_length_gap", "moderate_length_gap", "small_length_gap"}
 )
-# Supporting set for `small_length_gap` emission. `gather_indicators` also
-# accepts raw `missing_feature_state` / `missing_api_or_kind` token counts
-# as evidence (gate-only — never emitted as indicators).
+# Structural indicators (headings, code, anchors, versions, API tokens) —
+# excludes length-gap indicators. Used as the corroboration gate for
+# `small_length_gap` emission and for rule 4 in `classify_file_status`.
 _NON_LENGTH_INDICATORS: FrozenSet[str] = frozenset({
     "moderate_heading_loss", "severe_heading_loss",
     "moderate_code_loss", "severe_code_loss",
@@ -348,14 +348,15 @@ def _adjust_h2_as_h3(
     )
     return effective, note
 
-def _has_only_length_gap_indicator(stats: FileStats) -> bool:
+def _only_length_gap(stats: FileStats) -> bool:
+    # True when no structural loss is present — only a length gap fired.
     return (stats.missing_h2 == 0
             and stats.missing_h3 == 0
             and stats.missing_code_blocks == 0
             and stats.missing_anchors == 0
             and stats.missing_new_versions == 0)
 
-def _should_suppress_length_gap_short_en(
+def _suppress_gap_short_en(
     en: ParsedFile, l10n: ParsedFile, locale: str,
     level: str, has_support: bool,
 ) -> bool:
@@ -363,11 +364,11 @@ def _should_suppress_length_gap_short_en(
     version indicator backs up the mismatch."""
     if level == _LENGTH_GAP_NONE or l10n.visible_lines == 0 or has_support:
         return False
-    return (en.visible_lines < _LENGTH_GAP_REQUIRES_SUPPORT_BELOW_EN_LINES
+    return (en.visible_lines < _SHORT_EN_THRESHOLD
             or (locale in _CJK_LOCALES
-                and en.visible_lines < _CJK_LENGTH_GAP_REQUIRES_SUPPORT_BELOW_EN_LINES))
+                and en.visible_lines < _CJK_SHORT_EN_THRESHOLD))
 
-def _should_suppress_length_gap_ja_only(
+def _suppress_gap_ja(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile,
     locale: str, level: str,
 ) -> bool:
@@ -376,10 +377,10 @@ def _should_suppress_length_gap_ja_only(
     return (level in (_LENGTH_GAP_MODERATE, _LENGTH_GAP_LARGE)
             and l10n.visible_lines > 0
             and locale == "ja"
-            and en.visible_lines >= _CJK_LENGTH_GAP_REQUIRES_SUPPORT_BELOW_EN_LINES
-            and _has_only_length_gap_indicator(stats))
+            and en.visible_lines >= _CJK_SHORT_EN_THRESHOLD
+            and _only_length_gap(stats))
 
-def _should_suppress_length_gap_latin_compactness(
+def _suppress_gap_latin(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile,
     locale: str, level: str,
 ) -> bool:
@@ -389,9 +390,9 @@ def _should_suppress_length_gap_latin_compactness(
     return (level in (_LENGTH_GAP_MODERATE, _LENGTH_GAP_LARGE)
             and l10n.visible_lines > 0
             and locale in _LATIN_COMPACTNESS_LOCALES
-            and en.visible_lines >= _COMPACTNESS_CHECK_MIN_EN_LINES
-            and _has_only_length_gap_indicator(stats)
-            and stats.l10n_to_en_body_word_ratio >= _FULL_TRANSLATION_BODY_WORD_RATIO_MIN)
+            and en.visible_lines >= _LATIN_MIN_EN_LINES
+            and _only_length_gap(stats)
+            and stats.l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN)
 
 def analyze_file_indicators(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
@@ -418,13 +419,13 @@ def analyze_file_indicators(
         and not length_gap_reason
     )
 
-    if _should_suppress_length_gap_short_en(en, l10n, locale, level, has_support):
+    if _suppress_gap_short_en(en, l10n, locale, level, has_support):
         level, length_gap_reason = _LENGTH_GAP_NONE, ""
 
-    if _should_suppress_length_gap_ja_only(stats, en, l10n, locale, level):
+    if _suppress_gap_ja(stats, en, l10n, locale, level):
         level, length_gap_reason = _LENGTH_GAP_NONE, ""
 
-    if _should_suppress_length_gap_latin_compactness(stats, en, l10n, locale, level):
+    if _suppress_gap_latin(stats, en, l10n, locale, level):
         level, length_gap_reason = _LENGTH_GAP_NONE, ""
 
     return FileIndicatorSummary(
@@ -558,7 +559,7 @@ def _is_latin_translated_anchor_false_alarm(
     # carries full word volume. Without this guard, rule 4 falsely promotes them.
     return (
         locale in _LATIN_COMPACTNESS_LOCALES
-        and l10n_to_en_body_word_ratio >= _FULL_TRANSLATION_BODY_WORD_RATIO_MIN
+        and l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN
         and missing_anchors <= 2
         and len(non_length_gap_supporting) >= 1
         and all(s == "moderate_anchor_loss" for s in non_length_gap_supporting)
