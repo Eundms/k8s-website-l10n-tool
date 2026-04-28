@@ -14,8 +14,8 @@ Usage:
     python3 scripts/l10n-outdatedness-triage.py --lang ko ja zh-cn
 
     # Report generation options
-    python3 scripts/l10n-outdatedness-triage.py --lang ko --verbose
     python3 scripts/l10n-outdatedness-triage.py --lang ko --output-dir /tmp/l10n
+    python3 scripts/l10n-outdatedness-triage.py --lang ko --verbose
     python3 scripts/l10n-outdatedness-triage.py --lang ko --link web
     python3 scripts/l10n-outdatedness-triage.py --lang ko --link local
 
@@ -683,8 +683,9 @@ def build_locale_report(
     output_dir: str = ".",
 ) -> str:
     hi, poss, curr = count_files_by_status(evaluated)
+    total = len(evaluated) + len(orphans)
     w = max(len(STATUS_HIGHLY_OUTDATED), len(STATUS_POSSIBLY_OUTDATED),
-            len(STATUS_CURRENT), len("Evaluated"), len("Orphans"))
+            len(STATUS_CURRENT), len("Evaluated"), len("Orphan"))
     lines: List[str] = [
         f"## Localization status: `{locale}`",
         "",
@@ -694,9 +695,9 @@ def build_locale_report(
         "",
         "| Status | Count |",
         "|---|---:|",
-        f"| {'Evaluated':<{w}} | {len(evaluated)} |",
+        f"| {'Evaluated':<{w}} | {total} |",
         f"| {STATUS_CURRENT:<{w}} | {curr} |",
-        f"| {'Orphans':<{w}} | {len(orphans)} |",
+        f"| {'Orphan':<{w}} | {len(orphans)} |",
         f"| {STATUS_HIGHLY_OUTDATED:<{w}} | {hi} |",
         f"| {STATUS_POSSIBLY_OUTDATED:<{w}} | {poss} |",
         "",
@@ -770,14 +771,15 @@ def build_index_report(
         "",
         f"Generated: {date}",
         "",
-        f"| Locale | Report | Evaluated | {STATUS_CURRENT} | Orphans | {STATUS_HIGHLY_OUTDATED} | {STATUS_POSSIBLY_OUTDATED} |",
+        f"| Locale | Report | Evaluated | {STATUS_CURRENT} | Orphan | {STATUS_HIGHLY_OUTDATED} | {STATUS_POSSIBLY_OUTDATED} |",
         "|---|---|---:|---:|---:|---:|---:|",
     ]
     for locale, evaluated, orphans in results:
         hi, poss, curr = count_files_by_status(evaluated)
-        fname = f"l10n-indicators-{locale}.md"
+        total = len(evaluated) + len(orphans)
+        fname = f"l10n-status-{locale}.md"
         lines.append(
-            f"| `{locale}` | [{fname}]({fname}) | {len(evaluated)} |"
+            f"| `{locale}` | [{fname}]({fname}) | {total} |"
             f" {curr} | {len(orphans)} | {hi} | {poss} |"
         )
     lines.append("")
@@ -948,7 +950,7 @@ def main() -> None:
         evaluated, orphans = scan_locale(locale, repo_root)
         all_results.append((locale, evaluated, orphans))
         out_path = os.path.join(
-            args.output_dir, f"l10n-indicators-{locale}.md"
+            args.output_dir, f"l10n-status-{locale}.md"
         )
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(build_locale_report(
@@ -965,7 +967,7 @@ def main() -> None:
         )
 
     if len(locales) > 1:
-        index_path = os.path.join(args.output_dir, "l10n-indicators-index.md")
+        index_path = os.path.join(args.output_dir, "l10n-status-all.md")
         with open(index_path, "w", encoding="utf-8") as fh:
             fh.write(build_index_report(all_results, date))
         print(f"Wrote {index_path}", file=sys.stderr)
