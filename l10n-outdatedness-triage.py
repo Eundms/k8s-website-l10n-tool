@@ -612,6 +612,16 @@ def classify_file_status(
 
 # --- Report formatting ---
 
+_GITHUB_BASE = "https://github.com/kubernetes/website/blob"
+
+def _github_links(rel_path: str, locale: str, branch: str, locale_first: bool = False) -> str:
+    en_path = re.sub(rf"^content/{re.escape(locale)}/", "content/en/", rel_path)
+    base = f"{_GITHUB_BASE}/{branch}"
+    en_link = f"[(en)]({base}/{en_path}?plain=1)"
+    loc_link = f"[({locale})]({base}/{rel_path}?plain=1)"
+    pair = f"{loc_link} {en_link}" if locale_first else f"{en_link} {loc_link}"
+    return f"  {pair}"
+
 def _rel(path: str, repo_root: str) -> str:
     try:
         return os.path.relpath(path, repo_root)
@@ -644,6 +654,8 @@ def build_locale_report(
     repo_root: str,
     date: str,
     detailed: bool,
+    with_links: bool = False,
+    branch: str = "main",
 ) -> str:
     hi, poss, curr = count_files_by_status(evaluated)
     w = max(len(STATUS_HIGHLY_OUTDATED), len(STATUS_POSSIBLY_OUTDATED),
@@ -692,7 +704,9 @@ def build_locale_report(
         lines.append(f"_{_ORPHAN_REASON}_")
         lines.append("")
         for path in orphans:
-            lines.append(f"- `{_rel(path, repo_root)}`")
+            rel = _rel(path, repo_root)
+            links = "\n" + _github_links(rel, locale, branch, locale_first=True) if with_links else ""
+            lines.append(f"- `{rel}`{links}")
         lines.append("")
     else:
         lines.extend(["_None_", ""])
@@ -705,15 +719,19 @@ def build_locale_report(
             continue
         for fr in items:
             path = _rel(fr.localized_path, repo_root)
+            links = (
+                "\n" + _github_links(path, locale, branch)
+                if with_links else ""
+            )
             if detailed and fr.reasons:
-                lines.append(f"**`{path}`** — status: {fr.status}")
+                lines.append(f"**`{path}`** — status: {fr.status}{links}")
                 lines.extend(f"- {r}" for r in fr.reasons)
                 if fr.indicators:
                     lines.append(f"- Indicators: {', '.join(fr.indicators)}")
                 lines.append("")
             else:
                 first = fr.reasons[0] if fr.reasons else "(no indicators)"
-                lines.append(f"- `{path}` — {fr.status}: {first}")
+                lines.append(f"- `{path}` — {fr.status}: {first}{links}")
         if not detailed:
             lines.append("")
 
@@ -865,6 +883,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--verbose", "-v", action="store_true",
         help="Show all indicator lines per file (default: one compact line)",
     )
+    parser.add_argument(
+        "--with-links", action="store_true",
+        help=(
+            "Add [(en)] and [(<locale>)] GitHub links after each file entry "
+            "(opens code view). Target repo: github.com/kubernetes/website."
+        ),
+    )
+    parser.add_argument(
+        "--branch", default="main", metavar="BRANCH",
+        help="Branch for GitHub links (default: main)",
+    )
     return parser
 
 def main() -> None:
@@ -897,6 +926,7 @@ def main() -> None:
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(build_locale_report(
                 locale, evaluated, orphans, repo_root, date, args.verbose,
+                with_links=args.with_links, branch=args.branch,
             ))
         hi, poss, curr = count_files_by_status(evaluated)
         print(
