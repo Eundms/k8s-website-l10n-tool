@@ -163,7 +163,7 @@ class FileReport:
     reasons: List[str] = field(default_factory=list)
     indicators: List[str] = field(default_factory=list)
 
-# --- Parsing ---
+# --- Markdown parsing ---
 
 def _is_indented_code_block(raw_para: str) -> bool:
     lines = raw_para.splitlines()
@@ -248,7 +248,7 @@ def parse_markdown(path: str, locale: str = "") -> ParsedFile:
         api_kind_tokens=_extract_api_kind_tokens(text),
     )
 
-# --- Stats ---
+# --- File comparison / stats ---
 
 def _parse_version_minor(v: str) -> int:
     m = re.match(r"v1\.(\d+)", v)
@@ -290,7 +290,7 @@ def compute_stats(en: ParsedFile, l10n: ParsedFile) -> FileStats:
         missing_api_or_kind=missing_api_or_kind,
     )
 
-# --- Indicators ---
+# --- Length-gap classification ---
 
 def _classify_length_gap(l10n_to_en_line_ratio: float) -> str:
     if l10n_to_en_line_ratio < 0.50:
@@ -325,29 +325,6 @@ def _build_length_gap_reason(level: str, l10n_to_en_line_ratio: float) -> str:
         )
     return ""
 
-def _adjust_zh_cn_heading(
-    stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
-) -> Tuple[int, str]:
-    # zh-cn bilingual files sometimes render source H2 as H3 (source heading
-    # kept in a comment). When H3 surplus covers the H2 deficit, count as 1
-    # missing H2; predicates guard against genuine small H2 deficits.
-    if not (locale == "zh-cn"
-            and stats.missing_h2 >= 3
-            and l10n.h3 > en.h3
-            and (l10n.h3 - en.h3) >= stats.missing_h2
-            and stats.l10n_to_en_line_ratio >= 0.70
-            and stats.missing_code_blocks <= 1):
-        return stats.missing_h2, ""
-    effective = min(1, stats.missing_h2)
-    suppressed = stats.missing_h2 - effective
-    note = (
-        f"Possible heading-level mismatch: {suppressed} of {stats.missing_h2} "
-        f"apparent missing H2(s) may have been translated as H3(s) in the "
-        f"zh-cn file (zh-cn has {l10n.h3 - en.h3} more H3s than source) — "
-        "counted as 1 H2; verify manually"
-    )
-    return effective, note
-
 def _is_only_length_gap(stats: FileStats) -> bool:
     # True when no structural loss is present — only a length gap fired.
     return (stats.missing_h2 == 0
@@ -356,43 +333,74 @@ def _is_only_length_gap(stats: FileStats) -> bool:
             and stats.missing_anchors == 0
             and stats.missing_new_versions == 0)
 
-def _is_length_gap_unreliable(
-    en: ParsedFile, l10n: ParsedFile, locale: str,
-    level: str, has_support: bool,
+def _should_ignore_length_gap(
+    stats: FileStats, en: ParsedFile, l10n: ParsedFile,
+    locale: str, level: str, has_support: bool,
 ) -> bool:
-    """Drop length gap when EN<40 (or <56 for CJK) and no heading/code/
-    version indicator backs up the mismatch."""
-    if level == _LENGTH_GAP_NONE or l10n.visible_lines == 0 or has_support:
+    """Drop length gap when unreliable (short EN <40, or <56 CJK, no support)
+    or expected by locale shape (no other indicator fired).
+    JA: empirically a false alarm; zh-cn has real drift at this shape.
+    Latin: full translations run loose-wrapped (>=0.94 body ratio);
+    ru drift sits at <=0.85."""
+    if level == _LENGTH_GAP_NONE or l10n.visible_lines == 0:
         return False
-    return (en.visible_lines < _SHORT_EN_THRESHOLD
+    if not has_support and (
+            en.visible_lines < _SHORT_EN_THRESHOLD
             or (locale in _CJK_LOCALES
-                and en.visible_lines < _CJK_SHORT_EN_THRESHOLD))
+                and en.visible_lines < _CJK_SHORT_EN_THRESHOLD)):
+        return True
+    if (level in (_LENGTH_GAP_MODERATE, _LENGTH_GAP_LARGE)
+            and _is_only_length_gap(stats)):
+        if locale == "ja" and en.visible_lines >= _CJK_SHORT_EN_THRESHOLD:
+            return True
+        if (locale in _LATIN_COMPACTNESS_LOCALES
+                and en.visible_lines >= _LATIN_MIN_EN_LINES
+                and stats.l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN):
+            return True
+    return False
 
-def _is_ja_length_gap_expected(
-    stats: FileStats, en: ParsedFile, l10n: ParsedFile,
-    locale: str, level: str,
-) -> bool:
-    """JA-only override: drop length gap when no other indicator fires.
-    Empirically a false alarm in JA; zh-cn has real drift at this shape."""
-    return (level in (_LENGTH_GAP_MODERATE, _LENGTH_GAP_LARGE)
-            and l10n.visible_lines > 0
-            and locale == "ja"
-            and en.visible_lines >= _CJK_SHORT_EN_THRESHOLD
-            and _is_only_length_gap(stats))
+# --- Locale-specific adjustments ---
 
-def _is_latin_length_gap_expected(
-    stats: FileStats, en: ParsedFile, l10n: ParsedFile,
-    locale: str, level: str,
+def _resolve_effective_heading_loss(
+    stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
+) -> Tuple[int, str]:
+    """Missing H2 count after locale-specific adjustments."""
+    # zh-cn bilingual files sometimes render source H2 as H3 (source heading
+    # kept in a comment). When H3 surplus covers the H2 deficit, count as 1
+    # missing H2; predicates guard against genuine small H2 deficits.
+    if (locale == "zh-cn"
+            and stats.missing_h2 >= 3
+            and l10n.h3 > en.h3
+            and (l10n.h3 - en.h3) >= stats.missing_h2
+            and stats.l10n_to_en_line_ratio >= 0.70
+            and stats.missing_code_blocks <= 1):
+        effective = min(1, stats.missing_h2)
+        adjusted = stats.missing_h2 - effective
+        note = (
+            f"Possible heading-level mismatch: {adjusted} of {stats.missing_h2} "
+            f"apparent missing H2(s) may have been translated as H3(s) in the "
+            f"zh-cn file (zh-cn has {l10n.h3 - en.h3} more H3s than source) — "
+            "counted as 1 H2; verify manually"
+        )
+        return effective, note
+    return stats.missing_h2, ""
+
+def _is_expected_anchor_loss_by_locale(
+    non_length_gap_supporting: Set[str], locale: str,
+    l10n_to_en_body_word_ratio: float, missing_anchors: int,
 ) -> bool:
-    """Latin override: drop length gap when body word volume matches a
-    full translation. The 0.90 floor separates loose-wrapped translations
-    (>=0.94) from ru drift (<=0.85)."""
-    return (level in (_LENGTH_GAP_MODERATE, _LENGTH_GAP_LARGE)
-            and l10n.visible_lines > 0
-            and locale in _LATIN_COMPACTNESS_LOCALES
-            and en.visible_lines >= _LATIN_MIN_EN_LINES
-            and _is_only_length_gap(stats)
-            and stats.l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN)
+    # Latin: some locales translate anchor IDs instead of preserving the
+    # source identifier — looks compact with a small anchor mismatch but
+    # carries full word volume. Without this guard, rule 4 falsely promotes them.
+    return (
+        locale in _LATIN_COMPACTNESS_LOCALES
+        and l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN
+        and missing_anchors <= 2
+        and len(non_length_gap_supporting) >= 1
+        and all(s == "moderate_anchor_loss" for s in non_length_gap_supporting)
+    )
+
+# --- Indicator detection ---
 
 def build_indicators(
     stats: FileStats, en: ParsedFile, l10n: ParsedFile, locale: str,
@@ -408,18 +416,14 @@ def build_indicators(
     else:
         level = _LENGTH_GAP_NONE
 
-    eff_h2, _ = _adjust_zh_cn_heading(stats, en, l10n, locale)
+    eff_h2, _ = _resolve_effective_heading_loss(stats, en, l10n, locale)
 
     has_support = (
         eff_h2 > 0 or stats.missing_h3 > 0
         or stats.missing_code_blocks > 0 or stats.missing_new_versions > 0
     )
 
-    if _is_length_gap_unreliable(en, l10n, locale, level, has_support):
-        level = _LENGTH_GAP_NONE
-    if _is_ja_length_gap_expected(stats, en, l10n, locale, level):
-        level = _LENGTH_GAP_NONE
-    if _is_latin_length_gap_expected(stats, en, l10n, locale, level):
+    if _should_ignore_length_gap(stats, en, l10n, locale, level, has_support):
         level = _LENGTH_GAP_NONE
 
     if level == _LENGTH_GAP_LARGE and l10n.visible_lines > 0:
@@ -460,7 +464,54 @@ def build_indicators(
 
     return indicators
 
-# --- Reason rendering ---
+# --- Status classification ---
+
+def classify_status(
+    indicators: List[str], *,
+    locale: str, l10n_to_en_body_word_ratio: float, missing_anchors: int,
+) -> str:
+    """Classification rules, in order:
+
+    1. `empty_stub` or `severe_api_and_feature_mismatch` → Outdated.
+    2. ≥2 strong → Outdated.
+    3. ≥1 strong + ≥1 supporting → Outdated.
+    4. `large_length_gap` + ≥1 non-length-gap supporting → Outdated
+       (guarded against the Latin translated-anchor false-alarm).
+    5. ≥3 supporting → Outdated.
+    6. ≥1 strong or ≥1 supporting → Possibly outdated.
+    7. `small_length_gap` → Possibly outdated.
+    8. Otherwise → Up to date.
+    """
+    if not indicators:
+        return STATUS_CURRENT
+
+    indset = set(indicators)
+    strong = indset & _STRONG_INDICATORS
+    supporting = indset & _SUPPORTING_INDICATORS
+
+    if "empty_stub" in indset:
+        return STATUS_HIGHLY_OUTDATED
+    if "severe_api_and_feature_mismatch" in indset:
+        return STATUS_HIGHLY_OUTDATED
+    if len(strong) >= 2:
+        return STATUS_HIGHLY_OUTDATED
+    if strong and supporting:
+        return STATUS_HIGHLY_OUTDATED
+    if "large_length_gap" in indset:
+        non_length_gap = supporting - _LENGTH_GAP_INDICATORS
+        if non_length_gap and not _is_expected_anchor_loss_by_locale(
+                non_length_gap, locale,
+                l10n_to_en_body_word_ratio, missing_anchors):
+            return STATUS_HIGHLY_OUTDATED
+    if len(supporting) >= 3:
+        return STATUS_HIGHLY_OUTDATED
+    if strong or supporting:
+        return STATUS_POSSIBLY_OUTDATED
+    if "small_length_gap" in indset:
+        return STATUS_POSSIBLY_OUTDATED
+    return STATUS_CURRENT
+
+# --- Reason generation ---
 
 _ONLY_ANCHOR_INDICATOR_SUFFIX = (
     " (only indicator — may reflect anchor naming differences, "
@@ -483,7 +534,7 @@ def build_reasons(
     elif "small_length_gap" in indset:
         reasons.append(_build_length_gap_reason(_LENGTH_GAP_SMALL, stats.l10n_to_en_line_ratio))
 
-    eff_h2, h2_as_h3_note = _adjust_zh_cn_heading(stats, en, l10n, locale)
+    eff_h2, h2_as_h3_note = _resolve_effective_heading_loss(stats, en, l10n, locale)
     if eff_h2 > 0 or stats.missing_h3 > 0:
         parts = []
         if eff_h2:
@@ -532,97 +583,102 @@ def build_reasons(
 
     return reasons or [_FALLBACK_REASON]
 
-# --- Classifier ---
+# --- Per-file analysis ---
 
-def _is_latin_anchor_expected(
-    non_length_gap_supporting: Set[str], locale: str,
-    l10n_to_en_body_word_ratio: float, missing_anchors: int,
-) -> bool:
-    # Some Latin locales translate anchor IDs instead of preserving the
-    # source identifier — looks compact with a small anchor mismatch but
-    # carries full word volume. Without this guard, rule 4 falsely promotes them.
-    return (
-        locale in _LATIN_COMPACTNESS_LOCALES
-        and l10n_to_en_body_word_ratio >= _LATIN_BODY_RATIO_MIN
-        and missing_anchors <= 2
-        and len(non_length_gap_supporting) >= 1
-        and all(s == "moderate_anchor_loss" for s in non_length_gap_supporting)
+def analyze_file_pair(
+    en_path: str, l10n_path: str, locale: str,
+) -> FileReport:
+    en = parse_markdown(en_path)
+    l10n = parse_markdown(l10n_path)
+    stats = compute_stats(en, l10n)
+    indicators = build_indicators(stats, en, l10n, locale)
+    status = classify_status(
+        indicators,
+        locale=locale,
+        l10n_to_en_body_word_ratio=stats.l10n_to_en_body_word_ratio,
+        missing_anchors=stats.missing_anchors,
+    )
+    reasons = (
+        build_reasons(stats, en, l10n, locale, indicators)
+        if status != STATUS_CURRENT else []
+    )
+    return FileReport(
+        localized_path=l10n_path,
+        status=status,
+        reasons=reasons,
+        indicators=indicators,
     )
 
-def classify_status(
-    indicators: List[str], *,
-    locale: str, l10n_to_en_body_word_ratio: float, missing_anchors: int,
-) -> str:
-    """Classification rules, in order:
+# --- Locale scanning ---
 
-    1. `empty_stub` or `severe_api_and_feature_mismatch` → Outdated.
-    2. ≥2 strong → Outdated.
-    3. ≥1 strong + ≥1 supporting → Outdated.
-    4. `large_length_gap` + ≥1 non-length-gap supporting → Outdated
-       (guarded against the Latin translated-anchor false-alarm).
-    5. ≥3 supporting → Outdated.
-    6. ≥1 strong or ≥1 supporting → Possibly outdated.
-    7. `small_length_gap` → Possibly outdated.
-    8. Otherwise → Up to date.
-    """
-    if not indicators:
-        return STATUS_CURRENT
+def _is_candidate_orphan(l10n_path: str, locale: str) -> bool:
+    fname = os.path.basename(l10n_path)
+    if fname in _ORPHAN_SKIP_BASENAMES:
+        return False
+    rel = l10n_path.split(f"content/{locale}/", 1)[-1]
+    return rel.startswith("docs/")
 
-    indset = set(indicators)
-    strong = indset & _STRONG_INDICATORS
-    supporting = indset & _SUPPORTING_INDICATORS
+def scan_locale(
+    locale: str, repo_root: str,
+) -> Tuple[List[FileReport], List[str]]:
+    locale_dir = os.path.join(repo_root, "content", locale)
+    if not os.path.isdir(locale_dir):
+        print(f"error: locale directory not found: {locale_dir}", file=sys.stderr)
+        sys.exit(1)
 
-    if "empty_stub" in indset:
-        return STATUS_HIGHLY_OUTDATED
-    if "severe_api_and_feature_mismatch" in indset:
-        return STATUS_HIGHLY_OUTDATED
-    if len(strong) >= 2:
-        return STATUS_HIGHLY_OUTDATED
-    if strong and supporting:
-        return STATUS_HIGHLY_OUTDATED
-    if "large_length_gap" in indset:
-        non_length_gap = supporting - _LENGTH_GAP_INDICATORS
-        if non_length_gap and not _is_latin_anchor_expected(
-                non_length_gap, locale,
-                l10n_to_en_body_word_ratio, missing_anchors):
-            return STATUS_HIGHLY_OUTDATED
-    if len(supporting) >= 3:
-        return STATUS_HIGHLY_OUTDATED
-    if strong or supporting:
-        return STATUS_POSSIBLY_OUTDATED
-    if "small_length_gap" in indset:
-        return STATUS_POSSIBLY_OUTDATED
-    return STATUS_CURRENT
+    pairs: List[Tuple[str, str]] = []
+    orphan_paths: List[str] = []
+    for root, _, files in os.walk(locale_dir):
+        for fname in sorted(files):
+            if not fname.endswith(".md"):
+                continue
+            l10n_path = os.path.join(root, fname)
+            en_path = re.sub(r"content/[^/]+/", "content/en/", l10n_path)
+            if os.path.exists(en_path):
+                pairs.append((en_path, l10n_path))
+            elif _is_candidate_orphan(l10n_path, locale):
+                orphan_paths.append(l10n_path)
+
+    reports: List[FileReport] = []
+
+    total = len(pairs)
+    if total:
+        print(f"  [{locale}] evaluating {total} file pairs ...", file=sys.stderr)
+    for i, (en_path, l10n_path) in enumerate(pairs, 1):
+        if i % 100 == 0:
+            print(f"  [{locale}] {i}/{total}", file=sys.stderr)
+        reports.append(analyze_file_pair(en_path, l10n_path, locale))
+
+    reports.sort(
+        key=lambda fr: (_STATUS_SORT_KEY[fr.status], fr.localized_path)
+    )
+    orphan_paths.sort()
+    return reports, orphan_paths
 
 # --- Report formatting ---
 
 _GITHUB_BASE = "https://github.com/kubernetes/website/blob"
 
-def _github_links(rel_path: str, locale: str, branch: str, locale_first: bool = False) -> str:
-    en_path = re.sub(rf"^content/{re.escape(locale)}/", "content/en/", rel_path)
-    base = f"{_GITHUB_BASE}/{branch}"
-    en_link = f"[(en)]({base}/{en_path}?plain=1)"
-    loc_link = f"[({locale})]({base}/{rel_path}?plain=1)"
-    pair = f"{loc_link} {en_link}" if locale_first else f"{en_link} {loc_link}"
-    return f"  {pair}"
-
-def _local_links(rel_path: str, locale: str, output_dir: str, repo_root: str, locale_first: bool = False) -> str:
-    en_rel = re.sub(rf"^content/{re.escape(locale)}/", "content/en/", rel_path)
-    en_path = os.path.relpath(os.path.join(repo_root, en_rel), output_dir)
-    loc_path = os.path.relpath(os.path.join(repo_root, rel_path), output_dir)
-    en_link = f"[(en)]({en_path})"
-    loc_link = f"[({locale})]({loc_path})"
-    pair = f"{loc_link} {en_link}" if locale_first else f"{en_link} {loc_link}"
-    return f"  {pair}"
-
-def _build_links(
+def build_file_links(
     rel_path: str, locale: str, link_mode: str,
     branch: str, output_dir: str, repo_root: str,
     locale_first: bool = False,
 ) -> str:
+    """Build the "[(en)] [(locale)]" link pair shown after each file entry.
+    `local` mode emits report-relative paths; otherwise GitHub blob URLs.
+    `locale_first=True` swaps order for orphan entries."""
+    en_rel = re.sub(rf"^content/{re.escape(locale)}/", "content/en/", rel_path)
     if link_mode == "local":
-        return _local_links(rel_path, locale, output_dir, repo_root, locale_first)
-    return _github_links(rel_path, locale, branch, locale_first)
+        en_target = os.path.relpath(os.path.join(repo_root, en_rel), output_dir)
+        loc_target = os.path.relpath(os.path.join(repo_root, rel_path), output_dir)
+    else:
+        base = f"{_GITHUB_BASE}/{branch}"
+        en_target = f"{base}/{en_rel}?plain=1"
+        loc_target = f"{base}/{rel_path}?plain=1"
+    en_link = f"[(en)]({en_target})"
+    loc_link = f"[({locale})]({loc_target})"
+    pair = f"{loc_link} {en_link}" if locale_first else f"{en_link} {loc_link}"
+    return f"  {pair}"
 
 def _to_rel_path(path: str, repo_root: str) -> str:
     try:
@@ -709,7 +765,7 @@ def build_locale_report(
         lines.append("")
         for path in orphans:
             rel = _to_rel_path(path, repo_root)
-            links = "\n" + _build_links(rel, locale, link_mode, branch, output_dir, repo_root, locale_first=True) if link_mode else ""
+            links = "\n" + build_file_links(rel, locale, link_mode, branch, output_dir, repo_root, locale_first=True) if link_mode else ""
             lines.append(f"- `{rel}`{links}")
         lines.append("")
     else:
@@ -724,7 +780,7 @@ def build_locale_report(
         for fr in items:
             path = _to_rel_path(fr.localized_path, repo_root)
             links = (
-                "\n" + _build_links(path, locale, link_mode, branch, output_dir, repo_root)
+                "\n" + build_file_links(path, locale, link_mode, branch, output_dir, repo_root)
                 if link_mode else ""
             )
             if detailed and fr.reasons:
@@ -764,74 +820,6 @@ def build_index_report(
     return "\n".join(lines)
 
 # --- CLI / orchestration ---
-
-def evaluate_file_pair(
-    en_path: str, l10n_path: str, locale: str,
-) -> FileReport:
-    en = parse_markdown(en_path)
-    l10n = parse_markdown(l10n_path)
-    stats = compute_stats(en, l10n)
-    indicators = build_indicators(stats, en, l10n, locale)
-    status = classify_status(
-        indicators,
-        locale=locale,
-        l10n_to_en_body_word_ratio=stats.l10n_to_en_body_word_ratio,
-        missing_anchors=stats.missing_anchors,
-    )
-    reasons = (
-        build_reasons(stats, en, l10n, locale, indicators)
-        if status != STATUS_CURRENT else []
-    )
-    return FileReport(
-        localized_path=l10n_path,
-        status=status,
-        reasons=reasons,
-        indicators=indicators,
-    )
-
-def _is_candidate_orphan(l10n_path: str, locale: str) -> bool:
-    fname = os.path.basename(l10n_path)
-    if fname in _ORPHAN_SKIP_BASENAMES:
-        return False
-    rel = l10n_path.split(f"content/{locale}/", 1)[-1]
-    return rel.startswith("docs/")
-
-def scan_locale(
-    locale: str, repo_root: str,
-) -> Tuple[List[FileReport], List[str]]:
-    locale_dir = os.path.join(repo_root, "content", locale)
-    if not os.path.isdir(locale_dir):
-        print(f"error: locale directory not found: {locale_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    pairs: List[Tuple[str, str]] = []
-    orphan_paths: List[str] = []
-    for root, _, files in os.walk(locale_dir):
-        for fname in sorted(files):
-            if not fname.endswith(".md"):
-                continue
-            l10n_path = os.path.join(root, fname)
-            en_path = re.sub(r"content/[^/]+/", "content/en/", l10n_path)
-            if os.path.exists(en_path):
-                pairs.append((en_path, l10n_path))
-            elif _is_candidate_orphan(l10n_path, locale):
-                orphan_paths.append(l10n_path)
-
-    reports: List[FileReport] = []
-
-    total = len(pairs)
-    if total:
-        print(f"  [{locale}] evaluating {total} file pairs ...", file=sys.stderr)
-    for i, (en_path, l10n_path) in enumerate(pairs, 1):
-        if i % 100 == 0:
-            print(f"  [{locale}] {i}/{total}", file=sys.stderr)
-        reports.append(evaluate_file_pair(en_path, l10n_path, locale))
-
-    reports.sort(
-        key=lambda fr: (_STATUS_SORT_KEY[fr.status], fr.localized_path)
-    )
-    orphan_paths.sort()
-    return reports, orphan_paths
 
 def _auto_detect_repo_root() -> Optional[str]:
     d = os.path.abspath(os.getcwd())
